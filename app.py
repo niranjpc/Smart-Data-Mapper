@@ -1,31 +1,39 @@
 import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
-from sentence_transformers import SentenceTransformer, util
 import requests
 import tempfile
 
 # Get Hugging Face API key from Streamlit secrets
 hf_api_key = st.secrets["HUGGINGFACE_TOKEN"]
 
-# Load embedding model
-@st.cache_resource
-def load_embedder():
-    return SentenceTransformer("all-MiniLM-L6-v2")
+# Hugging Face API endpoints
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+GENERATION_MODEL = "google/flan-t5-small"
 
-embedder = load_embedder()
+def get_embeddings(texts, api_key):
+    """Get embeddings from Hugging Face Inference API."""
+    API_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBEDDING_MODEL}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    response = requests.post(API_URL, headers=headers, json={"inputs": texts})
+    response.raise_for_status()
+    return response.json()
 
-# Text generation using Hugging Face Inference API (free tier)
+def cosine_similarity(vec1, vec2):
+    """Compute cosine similarity between two vectors."""
+    import numpy as np
+    vec1 = np.array(vec1)
+    vec2 = np.array(vec2)
+    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+
 def generate_text(prompt, api_key):
-    if not api_key:
-        return "[No Hugging Face API key provided]"
-    API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-small"
+    """Generate text using Hugging Face Inference API."""
+    API_URL = f"https://api-inference.huggingface.co/models/{GENERATION_MODEL}"
     headers = {"Authorization": f"Bearer {api_key}"}
     payload = {"inputs": prompt, "parameters": {"max_new_tokens": 64}}
     response = requests.post(API_URL, headers=headers, json=payload)
     if response.status_code == 200:
         result = response.json()
-        # The result can be a list of dicts or a dict with 'error'
         if isinstance(result, list) and len(result) > 0 and 'generated_text' in result[0]:
             return result[0]['generated_text']
         elif isinstance(result, dict) and 'error' in result:
@@ -35,8 +43,8 @@ def generate_text(prompt, api_key):
     else:
         return f"[API Error: {response.status_code}]"
 
-st.title("🧠 Provider Data Mapper (RAG + LLM, Free Tier)")
-st.markdown("Upload your mapping and provider files. The app will auto-map fields and generate XML using free Hugging Face models.")
+st.title("🧠 Provider Data Mapper (RAG + LLM, Hugging Face API Only)")
+st.markdown("Upload your mapping and provider files. The app will auto-map fields and generate XML using only the Hugging Face Inference API (no local ML dependencies).")
 
 # Upload RAG mapping file
 st.header("📁 Step 1: Upload RAG Mapping File")
@@ -59,22 +67,31 @@ if prov_file:
 else:
     st.stop()
 
-# Main logic
 if st.button("🚀 Process Mapping"):
-    st.info("Processing... please wait")
+    st.info("Processing... please wait (API calls may take a few seconds)")
 
-    # Build mapping index using embeddings
-    rag_embeddings = embedder.encode(rag_df['fields'].astype(str).tolist(), convert_to_tensor=True)
+    # Get embeddings for RAG fields and provider columns
+    rag_fields = rag_df['fields'].astype(str).tolist()
+    prov_columns = prov_df.columns.astype(str).tolist()
+
+    # Get embeddings from Hugging Face API
+    rag_embeddings = get_embeddings(rag_fields, hf_api_key)
+    prov_embeddings = get_embeddings(prov_columns, hf_api_key)
+
+    import numpy as np
     results = []
     mapping_explanations = []
 
     for i, row in prov_df.iterrows():
         entry = {}
         explain = {}
-        for col in prov_df.columns:
-            query_emb = embedder.encode(col, convert_to_tensor=True)
-            sims = util.cos_sim(query_emb, rag_embeddings)[0].cpu().numpy()
-            best_idx = sims.argmax()
+        for col_idx, col in enumerate(prov_df.columns):
+            # Find best match in RAG fields using cosine similarity
+            similarities = [
+                cosine_similarity(prov_embeddings[col_idx], rag_emb)
+                for rag_emb in rag_embeddings
+            ]
+            best_idx = int(np.argmax(similarities))
             best_match = rag_df.iloc[best_idx]
             xml_path = best_match['xml field']
             value = row[col]
