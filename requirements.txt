@@ -2,8 +2,5 @@ streamlit
 pandas
 numpy
 openpyxl
-transformers
-sentence-transformers
 lxml
-torch
 requests
