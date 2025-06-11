@@ -1,111 +1,90 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import requests
-import faiss
+import xml.etree.ElementTree as ET
+from transformers import pipeline
 from sentence_transformers import SentenceTransformer
-from lxml import etree
-from io import BytesIO
-import re
+import tempfile
+import os
 
-# Load Hugging Face API token securely
-HF_TOKEN = st.secrets["HUGGINGFACEHUB_API_TOKEN"]
-HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
-HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+# Load lightweight model for demo
+@st.cache_resource
+def load_models():
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    generator = pipeline("text-generation", model="tiiuae/falcon-rw-1b")
+    return model, generator
 
-# ----------------- Utility Functions ------------------
+embedder, generator = load_models()
 
-def generate_explanation(prompt):
-    payload = {
-        "inputs": prompt,
-        "parameters": {"max_new_tokens": 100},
-    }
-    response = requests.post(HF_API_URL, headers=HEADERS, json=payload)
-    result = response.json()
-    if isinstance(result, list):
-        return result[0]['generated_text']
-    return "Explanation generation failed."
+st.title("🚀 Smart Provider Mapper (LLM + RAG Demo)")
+st.markdown("Demo for auto-mapping provider input to XML using AI + mapping config")
 
-def safe_xml_tag(tag):
-    if pd.isnull(tag) or not tag:
-        return None
-    tag = str(tag).split("/")[-1]
-    tag = re.sub(r"[^a-zA-Z0-9_]", "_", tag)
-    if tag[0].isdigit():
-        tag = f"field_{tag}"
-    return tag
+# Upload RAG mapping file
+st.header("📁 Step 1: Upload RAG Mapping File")
+rag_file = st.file_uploader("Upload `sample_rag_mapping.csv`", type=["csv"])
+if rag_file:
+    rag_df = pd.read_csv(rag_file)
+    st.success("RAG Mapping file uploaded!")
+else:
+    st.stop()
 
-# ----------------- FAISS Setup ------------------
-
-def build_faiss_index(rag_df, field_col='fields'):
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    rag_fields = rag_df[field_col].astype(str).tolist()
-    embeddings = embedder.encode(rag_fields)
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(np.array(embeddings).astype('float32'))
-    return embedder, index
-
-def retrieve_mapping(field_name, rag_df, embedder, index, field_col='fields'):
-    field_emb = embedder.encode([field_name])
-    D, I = index.search(np.array(field_emb).astype('float32'), 1)
-    return rag_df.iloc[I[0][0]]
-
-# ----------------- Streamlit UI ------------------
-
-st.title("🧠 AI-Powered Provider Data Mapper (Streamlit + Mistral)")
-
-with st.sidebar:
-    st.header("📁 Upload Files")
-    rag_file = st.file_uploader("RAG Mapping CSV", type=["csv"])
-    provider_file = st.file_uploader("Provider Input CSV", type=["csv", "xlsx"])
-    run_btn = st.button("🚀 Process Mapping")
-
-if run_btn:
-    if rag_file and provider_file:
-        with st.spinner("🔍 Building index and processing data..."):
-            rag_df = pd.read_csv(rag_file)
-            embedder, index = build_faiss_index(rag_df)
-
-            if provider_file.name.endswith(".csv"):
-                df = pd.read_csv(provider_file)
-            else:
-                df = pd.read_excel(provider_file)
-
-            mapping_report = []
-            xml_root = etree.Element("Providers")
-
-            for idx, row in df.iterrows():
-                provider = etree.SubElement(xml_root, "Provider")
-                for col in df.columns:
-                    mapping_row = retrieve_mapping(col, rag_df, embedder, index)
-                    value = row[col]
-                    prompt = (
-                        f"Field: {col}\n"
-                        f"Sample Value: {value}\n"
-                        f"XML Field: {mapping_row['xml field']}\n"
-                        f"Logic: {mapping_row['logic']}\n"
-                        f"Comments: {mapping_row['comments']}\n"
-                        f"Explain in simple terms how to map this field for HRP XML."
-                    )
-                    explanation = generate_explanation(prompt)
-                    xml_field = safe_xml_tag(mapping_row['xml field']) or col
-                    child = etree.SubElement(provider, xml_field)
-                    child.text = str(value)
-                    mapping_report.append({
-                        "Row": idx + 1,
-                        "Input Field": col,
-                        "Input Value": value,
-                        "XML Field": xml_field,
-                        "Logic": mapping_row['logic'],
-                        "LLM Explanation": explanation
-                    })
-
-            report_df = pd.DataFrame(mapping_report)
-            st.subheader("📄 Mapping Report")
-            st.dataframe(report_df)
-
-            xml_bytes = BytesIO(etree.tostring(xml_root, pretty_print=True))
-            st.subheader("📥 Download XML")
-            st.download_button("Download XML", xml_bytes, file_name="output.xml", mime="application/xml")
+# Upload provider file
+st.header("📄 Step 2: Upload Provider File")
+prov_file = st.file_uploader("Upload `sample_provider_input.csv`", type=["csv", "xlsx"])
+if prov_file:
+    if prov_file.name.endswith(".csv"):
+        prov_df = pd.read_csv(prov_file)
     else:
-        st.warning("Please upload both RAG mapping file and provider input file.")
+        prov_df = pd.read_excel(prov_file)
+    st.success("Provider file uploaded!")
+else:
+    st.stop()
+
+# Main logic
+if st.button("🚀 Process Mapping"):
+    st.info("Processing... please wait")
+
+    # Build mapping index using embeddings
+    rag_embeddings = embedder.encode(rag_df['fields'], convert_to_tensor=True)
+    results = []
+
+    for i, row in prov_df.iterrows():
+        entry = {}
+        for col in prov_df.columns:
+            query_emb = embedder.encode(col, convert_to_tensor=True)
+            sims = (rag_embeddings @ query_emb).cpu().numpy()
+            best_match = rag_df.iloc[sims.argmax()]
+            xml_path = best_match['xml field']
+            value = row[col]
+            entry[xml_path] = value
+        results.append(entry)
+
+    # Convert to XML
+    def build_xml(provider_data):
+        provider_el = ET.Element("provider")
+        for path, val in provider_data.items():
+            parts = path.split("/")
+            current = provider_el
+            for part in parts[:-1]:
+                found = current.find(part)
+                if found is None:
+                    found = ET.SubElement(current, part)
+                current = found
+            ET.SubElement(current, parts[-1]).text = str(val)
+        return ET.tostring(provider_el, encoding="unicode")
+
+    st.subheader("📊 Output XMLs")
+    xml_strings = []
+    for data in results:
+        xml_str = build_xml(data)
+        xml_strings.append(xml_str)
+        st.code(xml_str, language="xml")
+
+    # Write to downloadable file
+    with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".xml") as f:
+        f.write("<providers>\n" + "\n".join(xml_strings) + "\n</providers>")
+        st.download_button("⬇️ Download Full XML", f.read(), file_name="providers.xml", mime="application/xml")
+
+st.markdown("---")
+st.markdown("📌 **Sample Files:**")
+st.markdown("- [sample_rag_mapping.csv](https://github.com/niranjpc/provider-mapper/blob/main/sample_rag_mapping.csv)")
+st.markdown("- [sample_provider_input.csv](https://github.com/niranjpc/provider-mapper/blob/main/sample_provider_input.csv)")
