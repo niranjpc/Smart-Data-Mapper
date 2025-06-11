@@ -15,14 +15,17 @@ GENERATION_MODEL = "microsoft/DialoGPT-medium"  # Alternative: "gpt2" or "facebo
 
 def get_embeddings(texts, api_key):
     """Get embeddings from Hugging Face Inference API."""
-    API_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{EMBEDDING_MODEL}"
+    # Correct URL format for Hugging Face Inference API
+    API_URL = f"https://api-inference.huggingface.co/models/{EMBEDDING_MODEL}"
     headers = {"Authorization": f"Bearer {api_key}"}
     
     # Add retry logic for model loading
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = requests.post(API_URL, headers=headers, json={"inputs": texts})
+            # Send the texts as inputs
+            payload = {"inputs": texts}
+            response = requests.post(API_URL, headers=headers, json=payload)
             
             if response.status_code == 503:
                 # Model is loading, wait and retry
@@ -30,24 +33,105 @@ def get_embeddings(texts, api_key):
                 st.warning(f"Model loading, waiting {wait_time} seconds... (attempt {attempt + 1}/{max_retries})")
                 time.sleep(wait_time)
                 continue
+            elif response.status_code == 404:
+                st.error(f"Model {EMBEDDING_MODEL} not found. Trying alternative...")
+                # Try alternative embedding model
+                return get_embeddings_fallback(texts, api_key)
                 
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            
+            # Handle different response formats
+            if isinstance(result, list):
+                return result
+            else:
+                st.error(f"Unexpected response format: {type(result)}")
+                return get_embeddings_fallback(texts, api_key)
             
         except requests.exceptions.RequestException as e:
             st.error(f"Embedding API error (attempt {attempt + 1}): {str(e)}")
             if attempt == max_retries - 1:
-                raise
+                return get_embeddings_fallback(texts, api_key)
             time.sleep(5)
     
-    raise Exception("Failed to get embeddings after all retries")
+    return get_embeddings_fallback(texts, api_key)
+
+def get_embeddings_fallback(texts, api_key):
+    """Fallback embedding method using alternative models."""
+    fallback_models = [
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "sentence-transformers/paraphrase-MiniLM-L6-v2",
+        "sentence-transformers/all-mpnet-base-v2"
+    ]
+    
+    for model in fallback_models:
+        try:
+            API_URL = f"https://api-inference.huggingface.co/models/{model}"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            payload = {"inputs": texts}
+            
+            response = requests.post(API_URL, headers=headers, json=payload)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list):
+                    st.success(f"Using fallback embedding model: {model}")
+                    return result
+            elif response.status_code == 503:
+                st.warning(f"Model {model} is loading, trying next...")
+                continue
+                
+        except Exception as e:
+            st.warning(f"Fallback model {model} failed: {str(e)}")
+            continue
+    
+    # If all embedding models fail, create simple fallback embeddings
+    st.warning("All embedding models failed. Using simple text-based similarity.")
+    return create_simple_embeddings(texts)
+
+def create_simple_embeddings(texts):
+    """Create simple embeddings based on text similarity when API fails."""
+    import hashlib
+    
+    # Simple word-based embeddings as fallback
+    embeddings = []
+    for text in texts:
+        # Create a simple vector based on character frequencies and word lengths
+        text_lower = str(text).lower()
+        
+        # Create a 384-dimensional vector (matching typical embedding size)
+        embedding = [0.0] * 384
+        
+        # Fill with simple features
+        for i, char in enumerate(text_lower[:384]):
+            embedding[i] = ord(char) / 128.0  # Normalize ASCII values
+        
+        # Add some word-based features
+        words = text_lower.split()
+        if words:
+            avg_word_len = sum(len(word) for word in words) / len(words)
+            embedding[0] = avg_word_len / 10.0  # Normalize
+            embedding[1] = len(words) / 10.0    # Word count
+            embedding[2] = len(text_lower) / 100.0  # Character count
+        
+        embeddings.append(embedding)
+    
+    return embeddings
 
 def cosine_similarity(vec1, vec2):
     """Compute cosine similarity between two vectors."""
     import numpy as np
     vec1 = np.array(vec1)
     vec2 = np.array(vec2)
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+    
+    # Handle zero vectors
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    
+    return np.dot(vec1, vec2) / (norm1 * norm2)
 
 def generate_text(prompt, api_key):
     """Generate text using Hugging Face Inference API."""
