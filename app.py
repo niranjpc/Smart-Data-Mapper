@@ -4,211 +4,48 @@ import xml.etree.ElementTree as ET
 import requests
 import tempfile
 import time
+from difflib import SequenceMatcher
 
-# Get Hugging Face API key from Streamlit secrets
-hf_api_key = st.secrets["HUGGINGFACE_TOKEN"]
+# Simple text similarity approach - no API required
+def text_similarity(text1, text2):
+    """Calculate similarity between two texts using built-in difflib."""
+    return SequenceMatcher(None, str(text1).lower(), str(text2).lower()).ratio()
 
-# Hugging Face API endpoints
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-# Changed to a more reliable generation model for Inference API
-GENERATION_MODEL = "microsoft/DialoGPT-medium"  # Alternative: "gpt2" or "facebook/blenderbot-400M-distill"
-
-def get_embeddings(texts, api_key):
-    """Get embeddings from Hugging Face Inference API."""
-    # Correct URL format for Hugging Face Inference API
-    API_URL = f"https://api-inference.huggingface.co/models/{EMBEDDING_MODEL}"
-    headers = {"Authorization": f"Bearer {api_key}"}
+def find_best_match(provider_column, rag_fields_list):
+    """Find the best matching RAG field for a provider column."""
+    best_score = 0
+    best_idx = 0
     
-    # Add retry logic for model loading
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # Send the texts as inputs
-            payload = {"inputs": texts}
-            response = requests.post(API_URL, headers=headers, json=payload)
-            
-            if response.status_code == 503:
-                # Model is loading, wait and retry
-                wait_time = 20 * (attempt + 1)  # Exponential backoff
-                st.warning(f"Model loading, waiting {wait_time} seconds... (attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait_time)
-                continue
-            elif response.status_code == 404:
-                st.error(f"Model {EMBEDDING_MODEL} not found. Trying alternative...")
-                # Try alternative embedding model
-                return get_embeddings_fallback(texts, api_key)
-                
-            response.raise_for_status()
-            result = response.json()
-            
-            # Handle different response formats
-            if isinstance(result, list):
-                return result
-            else:
-                st.error(f"Unexpected response format: {type(result)}")
-                return get_embeddings_fallback(texts, api_key)
-            
-        except requests.exceptions.RequestException as e:
-            st.error(f"Embedding API error (attempt {attempt + 1}): {str(e)}")
-            if attempt == max_retries - 1:
-                return get_embeddings_fallback(texts, api_key)
-            time.sleep(5)
+    for i, rag_field in enumerate(rag_fields_list):
+        # Calculate similarity
+        score = text_similarity(provider_column, rag_field)
+        
+        # Also check if keywords match
+        provider_words = set(str(provider_column).lower().split())
+        rag_words = set(str(rag_field).lower().split())
+        
+        # Boost score if there are common words
+        common_words = provider_words.intersection(rag_words)
+        if common_words:
+            score += len(common_words) * 0.1
+        
+        if score > best_score:
+            best_score = score
+            best_idx = i
     
-    return get_embeddings_fallback(texts, api_key)
+    return best_idx, best_score
 
-def get_embeddings_fallback(texts, api_key):
-    """Fallback embedding method using alternative models."""
-    fallback_models = [
-        "sentence-transformers/all-MiniLM-L6-v2",
-        "sentence-transformers/paraphrase-MiniLM-L6-v2",
-        "sentence-transformers/all-mpnet-base-v2"
+def generate_simple_explanation(provider_field, xml_field, similarity_score):
+    """Generate a simple explanation for the mapping."""
+    explanations = [
+        f"Field '{provider_field}' matches '{xml_field}' with {similarity_score:.2%} similarity.",
+        f"The system mapped '{provider_field}' to '{xml_field}' based on text similarity analysis.",
+        f"Provider field '{provider_field}' was automatically mapped to XML path '{xml_field}'.",
     ]
-    
-    for model in fallback_models:
-        try:
-            API_URL = f"https://api-inference.huggingface.co/models/{model}"
-            headers = {"Authorization": f"Bearer {api_key}"}
-            payload = {"inputs": texts}
-            
-            response = requests.post(API_URL, headers=headers, json=payload)
-            
-            if response.status_code == 200:
-                result = response.json()
-                if isinstance(result, list):
-                    st.success(f"Using fallback embedding model: {model}")
-                    return result
-            elif response.status_code == 503:
-                st.warning(f"Model {model} is loading, trying next...")
-                continue
-                
-        except Exception as e:
-            st.warning(f"Fallback model {model} failed: {str(e)}")
-            continue
-    
-    # If all embedding models fail, create simple fallback embeddings
-    st.warning("All embedding models failed. Using simple text-based similarity.")
-    return create_simple_embeddings(texts)
+    return explanations[min(2, int(similarity_score * 3))]
 
-def create_simple_embeddings(texts):
-    """Create simple embeddings based on text similarity when API fails."""
-    import hashlib
-    
-    # Simple word-based embeddings as fallback
-    embeddings = []
-    for text in texts:
-        # Create a simple vector based on character frequencies and word lengths
-        text_lower = str(text).lower()
-        
-        # Create a 384-dimensional vector (matching typical embedding size)
-        embedding = [0.0] * 384
-        
-        # Fill with simple features
-        for i, char in enumerate(text_lower[:384]):
-            embedding[i] = ord(char) / 128.0  # Normalize ASCII values
-        
-        # Add some word-based features
-        words = text_lower.split()
-        if words:
-            avg_word_len = sum(len(word) for word in words) / len(words)
-            embedding[0] = avg_word_len / 10.0  # Normalize
-            embedding[1] = len(words) / 10.0    # Word count
-            embedding[2] = len(text_lower) / 100.0  # Character count
-        
-        embeddings.append(embedding)
-    
-    return embeddings
-
-def cosine_similarity(vec1, vec2):
-    """Compute cosine similarity between two vectors."""
-    import numpy as np
-    vec1 = np.array(vec1)
-    vec2 = np.array(vec2)
-    
-    # Handle zero vectors
-    norm1 = np.linalg.norm(vec1)
-    norm2 = np.linalg.norm(vec2)
-    
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    
-    return np.dot(vec1, vec2) / (norm1 * norm2)
-
-def generate_text(prompt, api_key):
-    """Generate text using Hugging Face Inference API."""
-    # Try multiple models as fallback
-    models_to_try = [
-        "microsoft/DialoGPT-medium",
-        "gpt2",
-        "facebook/blenderbot-400M-distill",
-        "google/flan-t5-small"
-    ]
-    
-    for model in models_to_try:
-        try:
-            API_URL = f"https://api-inference.huggingface.co/models/{model}"
-            headers = {"Authorization": f"Bearer {api_key}"}
-            
-            # Adjust parameters based on model type
-            if "flan-t5" in model:
-                payload = {
-                    "inputs": prompt,
-                    "parameters": {
-                        "max_new_tokens": 64,
-                        "temperature": 0.7,
-                        "do_sample": True
-                    }
-                }
-            else:
-                payload = {
-                    "inputs": prompt,
-                    "parameters": {
-                        "max_length": len(prompt.split()) + 64,
-                        "temperature": 0.7,
-                        "do_sample": True,
-                        "pad_token_id": 50256  # For GPT-2 based models
-                    }
-                }
-            
-            response = requests.post(API_URL, headers=headers, json=payload)
-            
-            if response.status_code == 503:
-                st.warning(f"Model {model} is loading, trying next model...")
-                continue
-                
-            if response.status_code == 200:
-                result = response.json()
-                
-                # Handle different response formats
-                if isinstance(result, list) and len(result) > 0:
-                    if 'generated_text' in result[0]:
-                        generated = result[0]['generated_text']
-                        # Remove the original prompt from the response
-                        if generated.startswith(prompt):
-                            generated = generated[len(prompt):].strip()
-                        return generated if generated else f"[Generated with {model}]"
-                    elif isinstance(result[0], str):
-                        return result[0]
-                elif isinstance(result, dict):
-                    if 'error' in result:
-                        st.warning(f"Model {model} error: {result['error']}, trying next model...")
-                        continue
-                    else:
-                        return str(result)
-                else:
-                    return f"[Response from {model}: {str(result)[:100]}...]"
-            else:
-                st.warning(f"Model {model} returned status {response.status_code}, trying next model...")
-                continue
-                
-        except Exception as e:
-            st.warning(f"Error with model {model}: {str(e)}, trying next model...")
-            continue
-    
-    # If all models fail, return a fallback explanation
-    return "[Unable to generate explanation - API models unavailable]"
-
-st.title("🧠 Provider Data Mapper (RAG + LLM, Hugging Face API Only)")
-st.markdown("Upload your mapping and provider files. The app will auto-map fields and generate XML using only the Hugging Face Inference API (no local ML dependencies).")
+st.title("🧠 Provider Data Mapper (Simple Text Matching)")
+st.markdown("Upload your mapping and provider files. The app will auto-map fields using text similarity (no API required).")
 
 # Upload RAG mapping file
 st.header("📁 Step 1: Upload RAG Mapping File")
@@ -234,22 +71,34 @@ else:
     st.stop()
 
 if st.button("🚀 Process Mapping"):
-    st.info("Processing... please wait (API calls may take a few seconds)")
+    st.info("Processing mappings using text similarity...")
     
     try:
-        # Get embeddings for RAG fields and provider columns
+        # Get field lists
         rag_fields = rag_df['fields'].astype(str).tolist()
         prov_columns = prov_df.columns.astype(str).tolist()
 
-        st.write("Getting embeddings for RAG fields...")
-        rag_embeddings = get_embeddings(rag_fields, hf_api_key)
-        
-        st.write("Getting embeddings for provider columns...")
-        prov_embeddings = get_embeddings(prov_columns, hf_api_key)
-
-        import numpy as np
         results = []
         mapping_explanations = []
+
+        # Show mapping preview
+        st.subheader("📋 Field Mappings Preview")
+        mapping_preview = []
+        
+        for col in prov_columns:
+            best_idx, similarity = find_best_match(col, rag_fields)
+            best_match = rag_df.iloc[best_idx]
+            xml_path = best_match['xml field']
+            
+            mapping_preview.append({
+                'Provider Field': col,
+                'XML Field': xml_path,
+                'RAG Field': best_match['fields'],
+                'Similarity': f"{similarity:.2%}"
+            })
+        
+        preview_df = pd.DataFrame(mapping_preview)
+        st.dataframe(preview_df)
 
         progress_bar = st.progress(0)
         total_rows = len(prov_df)
@@ -258,26 +107,17 @@ if st.button("🚀 Process Mapping"):
             entry = {}
             explain = {}
             
-            for col_idx, col in enumerate(prov_df.columns):
-                # Find best match in RAG fields using cosine similarity
-                similarities = [
-                    cosine_similarity(prov_embeddings[col_idx], rag_emb)
-                    for rag_emb in rag_embeddings
-                ]
-                best_idx = int(np.argmax(similarities))
+            for col in prov_df.columns:
+                # Find best match using text similarity
+                best_idx, similarity = find_best_match(col, rag_fields)
                 best_match = rag_df.iloc[best_idx]
                 xml_path = best_match['xml field']
                 value = row[col]
                 entry[xml_path] = value
                 
-                # Generate mapping logic explanation
-                prompt = (
-                    f"Explain why provider field '{col}' maps to XML field '{xml_path}'. "
-                    f"Logic: {best_match.get('logic', 'N/A')}. "
-                    f"Comments: {best_match.get('comments', 'N/A')}."
-                )
-                logic_explanation = generate_text(prompt, hf_api_key)
-                explain[col] = logic_explanation
+                # Generate simple explanation
+                explanation = generate_simple_explanation(col, xml_path, similarity)
+                explain[col] = explanation
                 
             results.append(entry)
             mapping_explanations.append(explain)
@@ -323,11 +163,11 @@ if st.button("🚀 Process Mapping"):
             mime="application/xml"
         )
         
-        st.success("✅ Processing completed!")
+        st.success("✅ Processing completed using text similarity matching!")
         
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
-        st.write("Please check your API key and try again. If the problem persists, the Hugging Face models might be temporarily unavailable.")
+        st.write("Please check your files and try again.")
 
 st.markdown("---")
 st.markdown("📌 **Sample Files:**")
@@ -335,10 +175,11 @@ st.markdown("- [sample_rag_mapping.csv](https://github.com/niranjpc/provider-map
 st.markdown("- [sample_provider_input.csv](https://github.com/niranjpc/provider-mapper/blob/main/sample_provider_input.csv)")
 
 st.markdown("---")
-st.markdown("🔧 **Troubleshooting Tips:**")
+st.markdown("🔧 **How it works:**")
 st.markdown("""
-- Ensure your Hugging Face API token is valid and set in Streamlit secrets
-- The embedding model may take time to load on first use
-- If generation fails, the app will try multiple models as fallbacks
-- Check the Hugging Face status page if all models are unavailable
+- Uses Python's built-in text similarity algorithms
+- No external API calls required
+- Matches provider fields to XML fields based on text similarity
+- Provides similarity scores for each mapping
+- Works offline and is completely free
 """)
