@@ -14,12 +14,14 @@ def find_best_match(provider_column, rag_dfs):
     best_score = 0
     best_row = None
     best_rag_file = ""
+    provider_str = str(provider_column) if pd.notna(provider_column) else ""
     for rag_file, rag_df in rag_dfs.items():
         for i, row in rag_df.iterrows():
             rag_field = row['fields']
-            score = text_similarity(provider_column, rag_field)
-            provider_words = set(str(provider_column).lower().split())
-            rag_words = set(str(rag_field).lower().split())
+            rag_str = str(rag_field) if pd.notna(rag_field) else ""
+            score = text_similarity(provider_str, rag_str)
+            provider_words = set(provider_str.lower().split())
+            rag_words = set(rag_str.lower().split())
             common_words = provider_words.intersection(rag_words)
             if common_words:
                 score += 0.05  # smaller boost
