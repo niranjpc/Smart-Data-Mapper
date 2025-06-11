@@ -1,59 +1,74 @@
 import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
-import requests
-import tempfile
-import time
 from difflib import SequenceMatcher
 
-# Simple text similarity approach - no API required
+# --- Helper Functions ---
+
 def text_similarity(text1, text2):
     """Calculate similarity between two texts using built-in difflib."""
     return SequenceMatcher(None, str(text1).lower(), str(text2).lower()).ratio()
 
-def find_best_match(provider_column, rag_fields_list):
-    """Find the best matching RAG field for a provider column."""
+def find_best_match(provider_column, rag_dfs):
+    """Find the best matching RAG field for a provider column across multiple RAG files."""
     best_score = 0
-    best_idx = 0
-    
-    for i, rag_field in enumerate(rag_fields_list):
-        # Calculate similarity
-        score = text_similarity(provider_column, rag_field)
-        
-        # Also check if keywords match
-        provider_words = set(str(provider_column).lower().split())
-        rag_words = set(str(rag_field).lower().split())
-        
-        # Boost score if there are common words
-        common_words = provider_words.intersection(rag_words)
-        if common_words:
-            score += len(common_words) * 0.1
-        
-        if score > best_score:
-            best_score = score
-            best_idx = i
-    
-    return best_idx, best_score
+    best_row = None
+    best_rag_file = ""
+    for rag_file, rag_df in rag_dfs.items():
+        for i, row in rag_df.iterrows():
+            rag_field = row['fields']
+            score = text_similarity(provider_column, rag_field)
+            provider_words = set(str(provider_column).lower().split())
+            rag_words = set(str(rag_field).lower().split())
+            common_words = provider_words.intersection(rag_words)
+            if common_words:
+                score += len(common_words) * 0.1
+            if score > best_score:
+                best_score = score
+                best_row = row
+                best_rag_file = rag_file
+    return best_row, best_score, best_rag_file
 
-def generate_simple_explanation(provider_field, xml_field, similarity_score):
+def generate_simple_explanation(provider_field, xml_field, similarity_score, logic, comments, rag_file):
     """Generate a simple explanation for the mapping."""
-    explanations = [
-        f"Field '{provider_field}' matches '{xml_field}' with {similarity_score:.2%} similarity.",
-        f"The system mapped '{provider_field}' to '{xml_field}' based on text similarity analysis.",
-        f"Provider field '{provider_field}' was automatically mapped to XML path '{xml_field}'.",
-    ]
-    return explanations[min(2, int(similarity_score * 3))]
+    return (
+        f"Field '{provider_field}' was mapped to XML field '{xml_field}' "
+        f"from RAG file '{rag_file}' with {similarity_score:.2%} confidence. "
+        f"Logic: {logic}. Comments: {comments}"
+    )
 
-st.title("🧠 Provider Data Mapper (Simple Text Matching)")
-st.markdown("Upload your mapping and provider files. The app will auto-map fields using text similarity (no API required).")
+def build_xml(provider_data):
+    provider_el = ET.Element("provider")
+    for path, val in provider_data.items():
+        if pd.isna(val):
+            val = ""
+        parts = path.split("/")
+        current = provider_el
+        for part in parts[:-1]:
+            found = current.find(part)
+            if found is None:
+                found = ET.SubElement(current, part)
+            current = found
+        ET.SubElement(current, parts[-1]).text = str(val)
+    return ET.tostring(provider_el, encoding="unicode")
 
-# Upload RAG mapping file
-st.header("📁 Step 1: Upload RAG Mapping File")
-rag_file = st.file_uploader("Upload `sample_rag_mapping.csv`", type=["csv"])
-if rag_file:
-    rag_df = pd.read_csv(rag_file)
-    st.success("RAG Mapping file uploaded!")
-    st.dataframe(rag_df.head())
+# --- Streamlit App ---
+
+st.title("🧠 Provider Data Mapper (Multi-RAG, Organized Preview & Reporting)")
+st.markdown("Upload multiple RAG mapping files and a provider file. The app will auto-map fields, show a detailed mapping preview, and let you download a mapping report and XML output.")
+
+# Upload multiple RAG mapping files
+st.header("📁 Step 1: Upload One or More RAG Mapping Files")
+rag_files = st.file_uploader("Upload one or more `sample_rag_mapping.csv` files", type=["csv"], accept_multiple_files=True)
+rag_dfs = {}
+if rag_files:
+    for rag_file in rag_files:
+        rag_df = pd.read_csv(rag_file)
+        rag_dfs[rag_file.name] = rag_df
+    st.success(f"{len(rag_files)} RAG Mapping file(s) uploaded!")
+    for name, df in rag_dfs.items():
+        st.markdown(f"**{name}:**")
+        st.dataframe(df.head())
 else:
     st.stop()
 
@@ -72,31 +87,30 @@ else:
 
 if st.button("🚀 Process Mapping"):
     st.info("Processing mappings using text similarity...")
-    
-    try:
-        # Get field lists
-        rag_fields = rag_df['fields'].astype(str).tolist()
-        prov_columns = prov_df.columns.astype(str).tolist()
 
+    try:
+        prov_columns = prov_df.columns.astype(str).tolist()
+        mapping_preview = []
         results = []
         mapping_explanations = []
+        mapping_report_rows = []
 
-        # Show mapping preview
-        st.subheader("📋 Field Mappings Preview")
-        mapping_preview = []
-        
+        # Preview and mapping logic
         for col in prov_columns:
-            best_idx, similarity = find_best_match(col, rag_fields)
-            best_match = rag_df.iloc[best_idx]
-            xml_path = best_match['xml field']
-            
+            best_row, similarity, rag_file = find_best_match(col, rag_dfs)
+            xml_path = best_row['xml field']
+            logic = best_row.get('logic', '')
+            comments = best_row.get('comments', '')
             mapping_preview.append({
                 'Provider Field': col,
                 'XML Field': xml_path,
-                'RAG Field': best_match['fields'],
-                'Similarity': f"{similarity:.2%}"
+                'Logic': logic,
+                'Comments': comments,
+                'Confidence': f"{similarity:.2%}",
+                'RAG File': rag_file
             })
-        
+
+        st.subheader("📋 Field Mappings Preview")
         preview_df = pd.DataFrame(mapping_preview)
         st.dataframe(preview_df)
 
@@ -106,55 +120,44 @@ if st.button("🚀 Process Mapping"):
         for i, row in prov_df.iterrows():
             entry = {}
             explain = {}
-            
             for col in prov_df.columns:
-                # Find best match using text similarity
-                best_idx, similarity = find_best_match(col, rag_fields)
-                best_match = rag_df.iloc[best_idx]
-                xml_path = best_match['xml field']
+                best_row, similarity, rag_file = find_best_match(col, rag_dfs)
+                xml_path = best_row['xml field']
+                logic = best_row.get('logic', '')
+                comments = best_row.get('comments', '')
                 value = row[col]
                 entry[xml_path] = value
-                
-                # Generate simple explanation
-                explanation = generate_simple_explanation(col, xml_path, similarity)
+                explanation = generate_simple_explanation(col, xml_path, similarity, logic, comments, rag_file)
                 explain[col] = explanation
-                
+                # For report
+                mapping_report_rows.append({
+                    'Provider Row': i+1,
+                    'Provider Field': col,
+                    'Value': value,
+                    'XML Field': xml_path,
+                    'Logic': logic,
+                    'Comments': comments,
+                    'Confidence': f"{similarity:.2%}",
+                    'RAG File': rag_file,
+                    'Explanation': explanation
+                })
             results.append(entry)
             mapping_explanations.append(explain)
-            
-            # Update progress
             progress_bar.progress((i + 1) / total_rows)
 
-        # Convert to XML
-        def build_xml(provider_data):
-            provider_el = ET.Element("provider")
-            for path, val in provider_data.items():
-                if pd.isna(val):
-                    val = ""
-                parts = path.split("/")
-                current = provider_el
-                for part in parts[:-1]:
-                    found = current.find(part)
-                    if found is None:
-                        found = ET.SubElement(current, part)
-                    current = found
-                ET.SubElement(current, parts[-1]).text = str(val)
-            return ET.tostring(provider_el, encoding="unicode")
-
+        # Output XMLs
         st.subheader("📊 Output XMLs")
         xml_strings = []
         for idx, data in enumerate(results):
             xml_str = build_xml(data)
             xml_strings.append(xml_str)
-            
             with st.expander(f"Provider {idx+1} - XML Output"):
                 st.code(xml_str, language="xml")
-                
             with st.expander(f"Provider {idx+1} - Mapping Explanations"):
                 for field, explanation in mapping_explanations[idx].items():
                     st.markdown(f"**{field}**: {explanation}")
 
-        # Create downloadable file
+        # Download XML
         full_xml = "<providers>\n" + "\n".join(xml_strings) + "\n</providers>"
         st.download_button(
             "⬇️ Download Full XML",
@@ -162,9 +165,19 @@ if st.button("🚀 Process Mapping"):
             file_name="providers.xml",
             mime="application/xml"
         )
-        
+
+        # Download Mapping Report
+        report_df = pd.DataFrame(mapping_report_rows)
+        csv = report_df.to_csv(index=False)
+        st.download_button(
+            "⬇️ Download Mapping Report (CSV)",
+            csv,
+            file_name="mapping_report.csv",
+            mime="text/csv"
+        )
+
         st.success("✅ Processing completed using text similarity matching!")
-        
+
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
         st.write("Please check your files and try again.")
@@ -177,9 +190,8 @@ st.markdown("- [sample_provider_input.csv](https://github.com/niranjpc/provider-
 st.markdown("---")
 st.markdown("🔧 **How it works:**")
 st.markdown("""
-- Uses Python's built-in text similarity algorithms
-- No external API calls required
-- Matches provider fields to XML fields based on text similarity
-- Provides similarity scores for each mapping
-- Works offline and is completely free
+- Supports multiple RAG mapping files
+- Shows a detailed mapping preview with logic, comments, and confidence
+- Lets you download a mapping report (CSV) and the generated XML
+- Uses Python's built-in text similarity algorithms (no API required)
 """)
