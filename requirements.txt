@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.25.0
 pandas
 numpy
 openpyxl
@@ -6,4 +6,5 @@ transformers
 sentence-transformers
 faiss-cpu
 lxml
-torch
+torch==2.0.1
+requests
