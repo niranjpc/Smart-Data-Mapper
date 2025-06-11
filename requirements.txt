@@ -6,5 +6,5 @@ transformers
 sentence-transformers
 faiss-cpu
 lxml
-torch==2.0.1
+torch
 requests
