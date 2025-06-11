@@ -10,7 +10,7 @@ def text_similarity(text1, text2):
     return SequenceMatcher(None, str(text1).lower(), str(text2).lower()).ratio()
 
 def find_best_match(provider_column, rag_dfs):
-    """Find the best matching RAG field for a provider column across multiple RAG files."""
+    """Find the best matching RAG field for a provider column across multiple reference data files."""
     best_score = 0
     best_row = None
     best_rag_file = ""
@@ -22,7 +22,8 @@ def find_best_match(provider_column, rag_dfs):
             rag_words = set(str(rag_field).lower().split())
             common_words = provider_words.intersection(rag_words)
             if common_words:
-                score += len(common_words) * 0.1
+                score += 0.05  # smaller boost
+            score = min(score, 1.0)  # Cap at 1.0 (100%)
             if score > best_score:
                 best_score = score
                 best_row = row
@@ -31,11 +32,14 @@ def find_best_match(provider_column, rag_dfs):
 
 def generate_simple_explanation(provider_field, xml_field, similarity_score, logic, comments, rag_file):
     """Generate a simple explanation for the mapping."""
-    return (
+    base = (
         f"Field '{provider_field}' was mapped to XML field '{xml_field}' "
-        f"from RAG file '{rag_file}' with {similarity_score:.2%} confidence. "
+        f"from reference file '{rag_file}' with {similarity_score:.2%} confidence. "
         f"Logic: {logic}. Comments: {comments}"
     )
+    if similarity_score < 0.5:
+        base += " ⚠️ Low confidence: Please review this mapping."
+    return base
 
 def build_xml(provider_data):
     provider_el = ET.Element("provider")
@@ -54,18 +58,18 @@ def build_xml(provider_data):
 
 # --- Streamlit App ---
 
-st.title("🧠 Provider Data Mapper (Multi-RAG, Organized Preview & Reporting)")
-st.markdown("Upload multiple RAG mapping files and a provider file. The app will auto-map fields, show a detailed mapping preview, and let you download a mapping report and XML output.")
+st.title("🧠 Smart Data Mapper")
+st.markdown("Upload multiple reference data files and a file to be mapped. The app will auto-map fields, show a detailed mapping preview, and let you download a mapping report and XML output.")
 
-# Upload multiple RAG mapping files
-st.header("📁 Step 1: Upload One or More RAG Mapping Files")
+# Upload multiple reference data files
+st.header("📁 Upload Reference Data")
 rag_files = st.file_uploader("Upload one or more `sample_rag_mapping.csv` files", type=["csv"], accept_multiple_files=True)
 rag_dfs = {}
 if rag_files:
     for rag_file in rag_files:
         rag_df = pd.read_csv(rag_file)
         rag_dfs[rag_file.name] = rag_df
-    st.success(f"{len(rag_files)} RAG Mapping file(s) uploaded!")
+    st.success(f"{len(rag_files)} reference data file(s) uploaded!")
     for name, df in rag_dfs.items():
         st.markdown(f"**{name}:**")
         st.dataframe(df.head())
@@ -73,14 +77,14 @@ else:
     st.stop()
 
 # Upload provider file
-st.header("📄 Step 2: Upload Provider File")
+st.header("📄 Upload the File to be Mapped")
 prov_file = st.file_uploader("Upload `sample_provider_input.csv`", type=["csv", "xlsx"])
 if prov_file:
     if prov_file.name.endswith(".csv"):
         prov_df = pd.read_csv(prov_file)
     else:
         prov_df = pd.read_excel(prov_file)
-    st.success("Provider file uploaded!")
+    st.success("File to be mapped uploaded!")
     st.dataframe(prov_df.head())
 else:
     st.stop()
@@ -106,8 +110,8 @@ if st.button("🚀 Process Mapping"):
                 'XML Field': xml_path,
                 'Logic': logic,
                 'Comments': comments,
-                'Confidence': f"{similarity:.2%}",
-                'RAG File': rag_file
+                'Confidence': f"{similarity:.2%}" + (" ⚠️" if similarity < 0.5 else ""),
+                'Reference File': rag_file
             })
 
         st.subheader("📋 Field Mappings Preview")
@@ -137,8 +141,8 @@ if st.button("🚀 Process Mapping"):
                     'XML Field': xml_path,
                     'Logic': logic,
                     'Comments': comments,
-                    'Confidence': f"{similarity:.2%}",
-                    'RAG File': rag_file,
+                    'Confidence': f"{similarity:.2%}" + (" ⚠️" if similarity < 0.5 else ""),
+                    'Reference File': rag_file,
                     'Explanation': explanation
                 })
             results.append(entry)
@@ -178,6 +182,24 @@ if st.button("🚀 Process Mapping"):
 
         st.success("✅ Processing completed using text similarity matching!")
 
+        # --- Simulated XML Output Example ---
+        st.markdown("#### Example XML Output (for one provider):")
+        st.code(
+            '''<provider>
+    <npi>1234567890</npi>
+    <name>
+        <first>John</first>
+        <last>Doe</last>
+    </name>
+    <dob>1980-01-01</dob>
+    <specialty>Cardiology</specialty>
+    <license>
+        <number>AB12345</number>
+        <state>CA</state>
+    </license>
+</provider>''', language="xml"
+        )
+
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
         st.write("Please check your files and try again.")
@@ -190,7 +212,7 @@ st.markdown("- [sample_provider_input.csv](https://github.com/niranjpc/provider-
 st.markdown("---")
 st.markdown("🔧 **How it works:**")
 st.markdown("""
-- Supports multiple RAG mapping files
+- Supports multiple reference data files
 - Shows a detailed mapping preview with logic, comments, and confidence
 - Lets you download a mapping report (CSV) and the generated XML
 - Uses Python's built-in text similarity algorithms (no API required)
