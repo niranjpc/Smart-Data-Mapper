@@ -1,0 +1,4 @@
+si#,fields,sample,load in to HRP (Y.N),xml field,logic,comments
+1,Phone,(555) 123-4567,Y,ProviderAdaptorRequest/.../contactPhone,"Remove all non-digit characters.","Phone normalization"
+2,Email,john.doe@example.com,Y,ProviderAdaptorRequest/.../contactEmail,"If email contains '@' and '.', set as is; else leave blank.","Email validation"
+3,Accepting New Patients,Yes,Y,ProviderAdaptorRequest/.../acceptingNew,"If Status is 'Active' and Accepting New Patients is 'Yes', set 'Y'; else 'N'.","Conditional logic"
