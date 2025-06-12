@@ -9,17 +9,23 @@ def text_similarity(text1, text2):
     return SequenceMatcher(None, str(text1).lower(), str(text2).lower()).ratio()
 
 def find_best_match(provider_column, rag_dfs):
+    """Find the best matching RAG field for a provider column across multiple reference data files."""
     best_score = 0
     best_row = None
     best_rag_file = ""
     provider_str = str(provider_column) if pd.notna(provider_column) else ""
+    def safe_words(val):
+        try:
+            return set(str(val).lower().split())
+        except Exception:
+            return set()
     for rag_file, rag_df in rag_dfs.items():
         for _, row in rag_df.iterrows():
             rag_field = row['fields']
             rag_str = str(rag_field) if pd.notna(rag_field) else ""
             score = text_similarity(provider_str, rag_str)
-            provider_words = set(provider_str.lower().split())
-            rag_words = set(rag_str.lower().split())
+            provider_words = safe_words(provider_str)
+            rag_words = safe_words(rag_str)
             common_words = provider_words.intersection(rag_words)
             if common_words:
                 score += 0.05
