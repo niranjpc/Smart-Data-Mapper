@@ -6,17 +6,15 @@ from difflib import SequenceMatcher
 # --- Helper Functions ---
 
 def text_similarity(text1, text2):
-    """Calculate similarity between two texts using built-in difflib."""
     return SequenceMatcher(None, str(text1).lower(), str(text2).lower()).ratio()
 
 def find_best_match(provider_column, rag_dfs):
-    """Find the best matching RAG field for a provider column across multiple reference data files."""
     best_score = 0
     best_row = None
     best_rag_file = ""
     provider_str = str(provider_column) if pd.notna(provider_column) else ""
     for rag_file, rag_df in rag_dfs.items():
-        for i, row in rag_df.iterrows():
+        for _, row in rag_df.iterrows():
             rag_field = row['fields']
             rag_str = str(rag_field) if pd.notna(rag_field) else ""
             score = text_similarity(provider_str, rag_str)
@@ -24,8 +22,8 @@ def find_best_match(provider_column, rag_dfs):
             rag_words = set(rag_str.lower().split())
             common_words = provider_words.intersection(rag_words)
             if common_words:
-                score += 0.05  # smaller boost
-            score = min(score, 1.0)  # Cap at 1.0 (100%)
+                score += 0.05
+            score = min(score, 1.0)
             if score > best_score:
                 best_score = score
                 best_row = row
@@ -33,7 +31,6 @@ def find_best_match(provider_column, rag_dfs):
     return best_row, best_score, best_rag_file
 
 def generate_simple_explanation(provider_field, xml_field, similarity_score, logic, comments, rag_file):
-    """Generate a simple explanation for the mapping."""
     base = (
         f"Field '{provider_field}' was mapped to XML field '{xml_field}' "
         f"from reference file '{rag_file}' with {similarity_score:.2%} confidence. "
@@ -58,40 +55,82 @@ def build_xml(provider_data):
         ET.SubElement(current, parts[-1]).text = str(val)
     return ET.tostring(provider_el, encoding="unicode")
 
-# --- Streamlit App ---
+# --- Sleek Streamlit UI ---
+
+st.set_page_config(page_title="Smart Data Mapper", layout="wide")
+st.markdown(
+    """
+    <style>
+    .stButton>button {background-color:#4F8BF9;color:white;font-weight:bold;}
+    .stProgress>div>div>div>div {background-color: #4F8BF9;}
+    .confidence-high {color: #228B22; font-weight: bold;}
+    .confidence-medium {color: #E6B800; font-weight: bold;}
+    .confidence-low {color: #D7263D; font-weight: bold;}
+    </style>
+    """, unsafe_allow_html=True
+)
 
 st.title("🧠 Smart Data Mapper")
-st.markdown("Upload multiple reference data files and a file to be mapped. The app will auto-map fields, show a detailed mapping preview, and let you download a mapping report and XML output.")
+st.caption("A modern, AI-inspired tool for mapping provider data to reference XML structures.")
 
-# Upload multiple reference data files
+with st.expander("ℹ️ How to use this tool", expanded=True):
+    st.markdown("""
+    1. **Upload one or more reference data files** (your mapping CSVs).
+    2. **Upload the file to be mapped** (your provider data).
+    3. **Click 'Process Mapping'** to see a smart preview, download a mapping report, and get your XML output.
+    - Confidence scores are color-coded for quick review.
+    - Low-confidence matches are flagged for your attention.
+    """)
+
+st.divider()
+
+# Upload reference data
 st.header("📁 Upload Reference Data")
-rag_files = st.file_uploader("Upload one or more `sample_rag_mapping.csv` files", type=["csv"], accept_multiple_files=True)
+rag_files = st.file_uploader(
+    "Upload one or more mapping CSVs (reference data)", 
+    type=["csv"], 
+    accept_multiple_files=True,
+    help="These files define how your provider fields should be mapped to XML."
+)
 rag_dfs = {}
 if rag_files:
     for rag_file in rag_files:
         rag_df = pd.read_csv(rag_file)
         rag_dfs[rag_file.name] = rag_df
-    st.success(f"{len(rag_files)} reference data file(s) uploaded!")
-    for name, df in rag_dfs.items():
-        st.markdown(f"**{name}:**")
-        st.dataframe(df.head())
+    st.success(f"{len(rag_files)} reference data file(s) uploaded.")
+    with st.expander("Preview Reference Data", expanded=False):
+        for name, df in rag_dfs.items():
+            st.markdown(f"**{name}:**")
+            st.dataframe(df.head())
 else:
+    st.info("Please upload at least one reference data file to continue.")
     st.stop()
+
+st.divider()
 
 # Upload provider file
 st.header("📄 Upload the File to be Mapped")
-prov_file = st.file_uploader("Upload `sample_provider_input.csv`", type=["csv", "xlsx"])
+prov_file = st.file_uploader(
+    "Upload your provider data (CSV or Excel)", 
+    type=["csv", "xlsx"],
+    help="This is the file whose fields you want to map to XML."
+)
 if prov_file:
     if prov_file.name.endswith(".csv"):
         prov_df = pd.read_csv(prov_file)
     else:
         prov_df = pd.read_excel(prov_file)
-    st.success("File to be mapped uploaded!")
-    st.dataframe(prov_df.head())
+    st.success("File to be mapped uploaded.")
+    with st.expander("Preview File to be Mapped", expanded=False):
+        st.dataframe(prov_df.head())
 else:
+    st.info("Please upload the file to be mapped to continue.")
     st.stop()
 
-if st.button("🚀 Process Mapping"):
+st.divider()
+
+# Process Mapping
+if st.button("🚀 Process Mapping", use_container_width=True):
     st.info("Processing mappings using text similarity...")
 
     try:
@@ -107,18 +146,25 @@ if st.button("🚀 Process Mapping"):
             xml_path = best_row['xml field']
             logic = best_row.get('logic', '')
             comments = best_row.get('comments', '')
+            # Color code confidence
+            if similarity >= 0.85:
+                conf_class = "confidence-high"
+            elif similarity >= 0.65:
+                conf_class = "confidence-medium"
+            else:
+                conf_class = "confidence-low"
             mapping_preview.append({
                 'Provider Field': col,
                 'XML Field': xml_path,
                 'Logic': logic,
                 'Comments': comments,
-                'Confidence': f"{similarity:.2%}" + (" ⚠️" if similarity < 0.5 else ""),
+                'Confidence': f"<span class='{conf_class}'>{similarity:.2%}</span>" + (" ⚠️" if similarity < 0.5 else ""),
                 'Reference File': rag_file
             })
 
         st.subheader("📋 Field Mappings Preview")
         preview_df = pd.DataFrame(mapping_preview)
-        st.dataframe(preview_df)
+        st.write(preview_df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
         progress_bar = st.progress(0)
         total_rows = len(prov_df)
@@ -135,7 +181,6 @@ if st.button("🚀 Process Mapping"):
                 entry[xml_path] = value
                 explanation = generate_simple_explanation(col, xml_path, similarity, logic, comments, rag_file)
                 explain[col] = explanation
-                # For report
                 mapping_report_rows.append({
                     'Provider Row': i+1,
                     'Provider Field': col,
@@ -151,15 +196,15 @@ if st.button("🚀 Process Mapping"):
             mapping_explanations.append(explain)
             progress_bar.progress((i + 1) / total_rows)
 
-        # Output XMLs
+        st.divider()
         st.subheader("📊 Output XMLs")
         xml_strings = []
         for idx, data in enumerate(results):
             xml_str = build_xml(data)
             xml_strings.append(xml_str)
-            with st.expander(f"Provider {idx+1} - XML Output"):
+            with st.expander(f"Provider {idx+1} - XML Output", expanded=False):
                 st.code(xml_str, language="xml")
-            with st.expander(f"Provider {idx+1} - Mapping Explanations"):
+            with st.expander(f"Provider {idx+1} - Mapping Explanations", expanded=False):
                 for field, explanation in mapping_explanations[idx].items():
                     st.markdown(f"**{field}**: {explanation}")
 
@@ -184,7 +229,6 @@ if st.button("🚀 Process Mapping"):
 
         st.success("✅ Processing completed using text similarity matching!")
 
-        # --- Simulated XML Output Example ---
         st.markdown("#### Example XML Output (for one provider):")
         st.code(
             '''<provider>
@@ -215,7 +259,7 @@ st.markdown("---")
 st.markdown("🔧 **How it works:**")
 st.markdown("""
 - Supports multiple reference data files
-- Shows a detailed mapping preview with logic, comments, and confidence
+- Shows a detailed mapping preview with logic, comments, and confidence (color-coded)
 - Lets you download a mapping report (CSV) and the generated XML
 - Uses Python's built-in text similarity algorithms (no API required)
 """)
