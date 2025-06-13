@@ -1,4 +1,4 @@
-# ✅ Refactored app.py with XML generation and production-grade HRP support
+# ✅ Refactored app.py with RAG-based mapping + HRP production-grade XML output
 
 import streamlit as st
 import pandas as pd
@@ -52,45 +52,67 @@ def build_hrp_xml(row: pd.Series) -> str:
 
 # --- Main App ---
 def main():
-    st.set_page_config(page_title="HRP Provider XML Generator", layout="wide")
+    st.set_page_config(page_title="HRP Smart Data Mapper", layout="wide")
     load_custom_css()
 
     st.markdown("""
         <div class="main-header">
-            <h1>🩺 HRP Provider XML Generator</h1>
-            <p>Generate production-ready XML for HealthRules Payor</p>
+            <h1>🧠 HRP Smart Data Mapper</h1>
+            <p>Upload RAG mapping + provider input file → get mapped XML</p>
         </div>
     """, unsafe_allow_html=True)
 
-    st.info("Upload provider data to generate standardized HRP XML output. Required fields: provider_id, provider_name, npi, tax_id, address_line1, city, state, zip, phone, email")
+    st.markdown("### 📁 Step 1: Upload RAG Mapping File (CSV with 'fields' and 'xml field')")
+    rag_file = st.file_uploader("RAG Mapping File", type=["csv"], key="rag")
 
-    uploaded = st.file_uploader("Upload Provider Excel File", type=["xlsx", "csv"])
-    if not uploaded:
+    st.markdown("### 📄 Step 2: Upload Provider Input File")
+    prov_file = st.file_uploader("Provider Input File", type=["csv", "xlsx"], key="provider")
+
+    if not rag_file or not prov_file:
+        st.info("Please upload both files to continue.")
         st.stop()
 
     try:
-        if uploaded.name.endswith(".csv"):
-            df = pd.read_csv(uploaded)
+        rag_df = pd.read_csv(rag_file)
+        if prov_file.name.endswith(".csv"):
+            prov_df = pd.read_csv(prov_file)
         else:
-            df = pd.read_excel(uploaded)
-        st.success(f"✅ Loaded {len(df)} records from {uploaded.name}")
+            prov_df = pd.read_excel(prov_file)
     except Exception as e:
-        st.error(f"❌ Failed to read file: {e}")
+        st.error(f"Error reading files: {e}")
         st.stop()
 
-    # Preview
-    st.dataframe(df.head())
+    st.success("✅ Files loaded successfully")
+    st.markdown("---")
+    st.markdown("### 🧠 Field Mapping Based on RAG")
 
-    # Generate XML for first 3
-    st.markdown("### 🧾 Sample XML Output")
-    for i in range(min(3, len(df))):
-        xml = build_hrp_xml(df.iloc[i])
+    rag_df.columns = rag_df.columns.str.strip().str.lower()
+    prov_df.columns = prov_df.columns.str.strip()
+
+    field_map = {}
+    for _, row in rag_df.iterrows():
+        src = row.get("fields")
+        tgt = row.get("xml field")
+        if pd.notna(src) and pd.notna(tgt):
+            field_map[str(src).strip()] = str(tgt).strip()
+
+    mapped_data = []
+    for _, row in prov_df.iterrows():
+        xml_row = {}
+        for col in prov_df.columns:
+            if col in field_map:
+                xml_row[field_map[col]] = row[col]
+        mapped_data.append(xml_row)
+
+    st.markdown("### 🔍 Sample Transformed XML Output")
+    sample_df = pd.DataFrame(mapped_data)
+    for i in range(min(3, len(sample_df))):
+        xml = build_hrp_xml(sample_df.iloc[i])
         st.markdown(f"#### Provider {i+1}")
         st.markdown(f"<div class='xml-box'>{xml}</div>", unsafe_allow_html=True)
 
-    # Full XML download
-    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n<Providers>\n' + '\n'.join([build_hrp_xml(row) for _, row in df.iterrows()]) + '\n</Providers>'
-    st.download_button("📥 Download Full HRP XML", full_xml, file_name="hrp_providers.xml", mime="application/xml")
+    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n<Providers>\n' + '\n'.join([build_hrp_xml(pd.Series(r)) for r in mapped_data]) + '\n</Providers>'
+    st.download_button("📥 Download Full Mapped XML", full_xml, file_name="mapped_providers.xml", mime="application/xml")
 
 if __name__ == "__main__":
     main()
