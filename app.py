@@ -1,5 +1,4 @@
-# ✅ Refactored app.py with improved UX and performance
-# This integrates the updated main() function into the full Streamlit app.
+# ✅ Refactored app.py with XML generation and production-grade HRP support
 
 import streamlit as st
 import pandas as pd
@@ -9,6 +8,8 @@ import requests
 import logging
 from datetime import datetime
 import io
+import time
+import xml.etree.ElementTree as ET
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -28,157 +29,68 @@ def load_custom_css():
     }
     .main-header h1 { font-size: 2.5rem; font-weight: 700; }
     .main-header p { font-size: 1.2rem; margin: 0; }
+    .xml-box { background-color: #f5f5f5; padding: 1rem; border-radius: 10px; margin-top: 1rem; font-family: monospace; white-space: pre-wrap; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- API Handler ---
-class HuggingFaceAPI:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://api-inference.huggingface.co"
-        self.headers = {"Authorization": f"Bearer {api_key}"}
+# --- XML Generator ---
+def build_hrp_xml(row: pd.Series) -> str:
+    provider = ET.Element("Provider")
+    ET.SubElement(provider, "ProviderID").text = str(row.get("provider_id", ""))
+    ET.SubElement(provider, "ProviderName").text = str(row.get("provider_name", ""))
+    ET.SubElement(provider, "NPI").text = str(row.get("npi", ""))
+    ET.SubElement(provider, "TaxID").text = str(row.get("tax_id", ""))
+    address = ET.SubElement(provider, "Address")
+    ET.SubElement(address, "Street").text = str(row.get("address_line1", ""))
+    ET.SubElement(address, "City").text = str(row.get("city", ""))
+    ET.SubElement(address, "State").text = str(row.get("state", ""))
+    ET.SubElement(address, "ZipCode").text = str(row.get("zip", ""))
+    contact = ET.SubElement(provider, "Contact")
+    ET.SubElement(contact, "Phone").text = str(row.get("phone", ""))
+    ET.SubElement(contact, "Email").text = str(row.get("email", ""))
+    return ET.tostring(provider, encoding="unicode")
 
-    def get_embeddings(self, texts: List[str], max_retries: int = 3) -> Optional[List[List[float]]]:
-        if not texts: return []
-        url = f"{self.base_url}/models/sentence-transformers/all-MiniLM-L6-v2"
-        all_embeddings = []
-        for i in range(0, len(texts), 10):
-            payload = {"inputs": texts[i:i+10], "options": {"wait_for_model": True}}
-            try:
-                response = requests.post(url, headers=self.headers, json=payload, timeout=30)
-                if response.status_code == 200:
-                    all_embeddings.extend(response.json())
-                elif response.status_code == 503:
-                    time.sleep(5)
-                else:
-                    return None
-            except Exception as e:
-                logger.error(f"Embedding error: {e}")
-                return None
-        return all_embeddings
-
-    def generate_text(self, prompt: str, max_retries: int = 3) -> str:
-        url = f"{self.base_url}/models/google/flan-t5-base"
-        try:
-            payload = {"inputs": prompt, "parameters": {"max_new_tokens": 100}}
-            response = requests.post(url, headers=self.headers, json=payload, timeout=30)
-            if response.status_code == 200:
-                result = response.json()
-                return result[0].get("generated_text", "")
-        except Exception as e:
-            logger.error(f"Text gen error: {e}")
-        return "Explanation unavailable"
-
-# --- Cosine Similarity ---
-def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    v1, v2 = np.array(vec1), np.array(vec2)
-    if np.linalg.norm(v1) == 0 or np.linalg.norm(v2) == 0:
-        return 0.0
-    return float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
-
-# --- File Validation ---
-def validate_file(file, file_type: str) -> (bool, str):
-    try:
-        if file_type == "reference":
-            df = pd.read_csv(file)
-            if 'fields' not in df.columns or 'xml field' not in df.columns:
-                return False, "Missing required columns: 'fields' and 'xml field'"
-        else:
-            if file.name.endswith(".csv"):
-                df = pd.read_csv(file)
-            else:
-                df = pd.read_excel(file)
-            if df.empty:
-                return False, "Empty provider file"
-        return True, "OK"
-    except Exception as e:
-        return False, f"Error: {str(e)}"
-
-# --- Main App Logic ---
+# --- Main App ---
 def main():
-    st.set_page_config(page_title="Smart Data Mapper Pro", page_icon="🧠", layout="wide")
+    st.set_page_config(page_title="HRP Provider XML Generator", layout="wide")
     load_custom_css()
 
     st.markdown("""
         <div class="main-header">
-            <h1>🧠 Smart Data Mapper Pro</h1>
-            <p>AI-Powered Data Mapping & XML Generation</p>
+            <h1>🩺 HRP Provider XML Generator</h1>
+            <p>Generate production-ready XML for HealthRules Payor</p>
         </div>
     """, unsafe_allow_html=True)
 
-    with st.sidebar:
-        st.header("⚙️ Configure")
-        if "HUGGINGFACE_TOKEN" in st.secrets:
-            api_key = st.secrets["HUGGINGFACE_TOKEN"]
+    st.info("Upload provider data to generate standardized HRP XML output. Required fields: provider_id, provider_name, npi, tax_id, address_line1, city, state, zip, phone, email")
+
+    uploaded = st.file_uploader("Upload Provider Excel File", type=["xlsx", "csv"])
+    if not uploaded:
+        st.stop()
+
+    try:
+        if uploaded.name.endswith(".csv"):
+            df = pd.read_csv(uploaded)
         else:
-            api_key = st.text_input("Hugging Face API Token", type="password")
+            df = pd.read_excel(uploaded)
+        st.success(f"✅ Loaded {len(df)} records from {uploaded.name}")
+    except Exception as e:
+        st.error(f"❌ Failed to read file: {e}")
+        st.stop()
 
-        if not api_key:
-            st.error("API Token required")
-            st.stop()
+    # Preview
+    st.dataframe(df.head())
 
-        with st.expander("Advanced Settings"):
-            confidence_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.7, 0.1)
-            batch_size = st.selectbox("Batch Size", [5, 10, 20, 50], index=1)
+    # Generate XML for first 3
+    st.markdown("### 🧾 Sample XML Output")
+    for i in range(min(3, len(df))):
+        xml = build_hrp_xml(df.iloc[i])
+        st.markdown(f"#### Provider {i+1}")
+        st.markdown(f"<div class='xml-box'>{xml}</div>", unsafe_allow_html=True)
 
-    st.markdown("<h4>Step 1: Upload Reference CSV</h4>", unsafe_allow_html=True)
-    ref_file = st.file_uploader("Reference CSV", type="csv")
-    if not ref_file: st.stop()
-
-    st.markdown("<h4>Step 2: Upload Provider File</h4>", unsafe_allow_html=True)
-    prov_file = st.file_uploader("Provider CSV/XLSX", type=["csv", "xlsx"])
-    if not prov_file: st.stop()
-
-    valid_ref, msg_ref = validate_file(ref_file, "reference")
-    valid_prov, msg_prov = validate_file(prov_file, "provider")
-    if not valid_ref: st.error(msg_ref); st.stop()
-    if not valid_prov: st.error(msg_prov); st.stop()
-
-    ref_file.seek(0); prov_file.seek(0)
-    ref_df = pd.read_csv(ref_file)
-    prov_df = pd.read_csv(prov_file) if prov_file.name.endswith(".csv") else pd.read_excel(prov_file)
-
-    if st.button("🚀 Start Mapping"):
-        hf_api = HuggingFaceAPI(api_key)
-
-        with st.spinner("Embedding reference fields..."):
-            ref_texts = ref_df['fields'].dropna().astype(str).tolist()
-            ref_embeddings = hf_api.get_embeddings(ref_texts)
-            if not ref_embeddings:
-                st.error("Failed to embed reference fields")
-                st.stop()
-
-        with st.spinner("Embedding provider fields..."):
-            prov_fields = prov_df.columns.astype(str).tolist()
-            prov_embeddings = hf_api.get_embeddings(prov_fields)
-            if not prov_embeddings:
-                st.error("Failed to embed provider fields")
-                st.stop()
-
-        mappings = []
-        with st.spinner("Calculating similarities..."):
-            for i, p_vec in enumerate(prov_embeddings):
-                best_score, best_idx = -1, -1
-                for j, r_vec in enumerate(ref_embeddings):
-                    score = cosine_similarity(p_vec, r_vec)
-                    if score > best_score:
-                        best_score, best_idx = score, j
-                mappings.append({
-                    "Provider Field": prov_fields[i],
-                    "XML Field": ref_df.iloc[best_idx]['xml field'],
-                    "Confidence": f"{best_score*100:.1f}%",
-                    "Status": "✅ High" if best_score >= confidence_threshold else "⚠️ Low"
-                })
-
-        st.success("✅ Mapping Complete")
-        st.dataframe(pd.DataFrame(mappings))
-
-        if st.checkbox("🔍 Generate AI Explanations (slower)"):
-            with st.spinner("Generating explanations..."):
-                for m in mappings:
-                    prompt = f"Explain why '{m['Provider Field']}' maps to '{m['XML Field']}'."
-                    m["AI Explanation"] = hf_api.generate_text(prompt)
-            st.dataframe(pd.DataFrame(mappings))
+    # Full XML download
+    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n<Providers>\n' + '\n'.join([build_hrp_xml(row) for _, row in df.iterrows()]) + '\n</Providers>'
+    st.download_button("📥 Download Full HRP XML", full_xml, file_name="hrp_providers.xml", mime="application/xml")
 
 if __name__ == "__main__":
     main()
