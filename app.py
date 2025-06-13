@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
 import requests
+import time
 
 # --- Gemini API Helper ---
 def gemini_generate(prompt, api_key):
@@ -117,22 +118,28 @@ if st.button("🚀 Process Mapping", use_container_width=True):
                 )
         reference_context_str = "\n".join(reference_context)
 
-        # Preview and mapping logic
+        # --- Gemini batching and caching ---
+        gemini_cache = {}
         for col in prov_columns:
-            # Compose prompt for Gemini
-            prompt = (
-                f"You are a US healthcare data mapping expert. "
-                f"Given the following reference data fields and mapping logic:\n{reference_context_str}\n\n"
-                f"Map the provider field '{col}' to the best XML field. "
-                f"Explain your reasoning, apply any transformation logic, and provide the XML path. "
-                f"Return your answer in this format:\n"
-                f"XML Field: <xml_path>\n"
-                f"Logic: <logic_applied>\n"
-                f"Comments: <comments>\n"
-                f"Confidence: <confidence 0-100%>\n"
-                f"Explanation: <explanation>"
-            )
-            gemini_response = gemini_generate(prompt, api_key)
+            if col in gemini_cache:
+                gemini_response = gemini_cache[col]
+            else:
+                prompt = (
+                    f"You are a US healthcare data mapping expert. "
+                    f"Given the following reference data fields and mapping logic:\n{reference_context_str}\n\n"
+                    f"Map the provider field '{col}' to the best XML field. "
+                    f"Explain your reasoning, apply any transformation logic, and provide the XML path. "
+                    f"Return your answer in this format:\n"
+                    f"XML Field: <xml_path>\n"
+                    f"Logic: <logic_applied>\n"
+                    f"Comments: <comments>\n"
+                    f"Confidence: <confidence 0-100%>\n"
+                    f"Explanation: <explanation>"
+                )
+                gemini_response = gemini_generate(prompt, api_key)
+                gemini_cache[col] = gemini_response
+                time.sleep(1)  # Delay to avoid rate limit
+
             # Parse Gemini's response (simple parsing)
             xml_field = ""
             logic = ""
@@ -170,7 +177,6 @@ if st.button("🚀 Process Mapping", use_container_width=True):
             entry = {}
             explain = {}
             for col in prov_df.columns:
-                # Use the mapping from preview
                 mapping = next((m for m in mapping_preview if m['Provider Field'] == col), None)
                 xml_path = mapping['XML Field'] if mapping else col
                 value = row[col]
