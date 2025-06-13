@@ -298,29 +298,138 @@ def build_xml(provider_data: Dict[str, any]) -> str:
         return f"<provider><error>XML generation failed: {str(e)}</error></provider>"
 
 def validate_file(file, file_type: str) -> Tuple[bool, str]:
-    """Validate uploaded files"""
+    """Validate uploaded files with enhanced error handling"""
     try:
         if file_type == "reference":
             if not file.name.endswith('.csv'):
                 return False, "Reference files must be CSV format"
             
-            # Try to read the file
-            df = pd.read_csv(file)
-            required_columns = ['fields', 'xml field']
+            # Reset file pointer to beginning
+            file.seek(0)
             
-            if not all(col in df.columns for col in required_columns):
-                return False, f"Reference CSV must contain columns: {required_columns}"
-                
-            if len(df) == 0:
-                return False, "Reference file cannot be empty"
+            # Try to read the file with different encodings and parameters
+            encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+            df = None
+            
+            for encoding in encodings_to_try:
+                try:
+                    file.seek(0)
+                    # Try with different separators and handle various CSV issues
+                    df = pd.read_csv(
+                        file, 
+                        encoding=encoding,
+                        sep=None,  # Auto-detect separator
+                        engine='python',  # More flexible parser
+                        skipinitialspace=True,
+                        na_values=['', 'NA', 'N/A', 'null', 'NULL'],
+                        keep_default_na=True,
+                        skip_blank_lines=True
+                    )
+                    break
+                except (UnicodeDecodeError, pd.errors.EmptyDataError):
+                    continue
+                except Exception as e:
+                    if encoding == encodings_to_try[-1]:  # Last encoding attempt
+                        return False, f"Unable to parse CSV: {str(e)}"
+                    continue
+            
+            if df is None or df.empty:
+                return False, "File is empty or cannot be parsed"
+            
+            # Clean column names - remove extra whitespace and convert to lowercase for comparison
+            df.columns = df.columns.str.strip()
+            column_names_lower = [col.lower() for col in df.columns]
+            
+            # Check for required columns (flexible matching)
+            required_columns = ['fields', 'xml field']
+            required_lower = [col.lower() for col in required_columns]
+            
+            missing_columns = []
+            for req_col, req_lower in zip(required_columns, required_lower):
+                if req_lower not in column_names_lower:
+                    # Try alternative column names
+                    alternatives = {
+                        'fields': ['field', 'field_name', 'source_field', 'provider_field'],
+                        'xml field': ['xml_field', 'target_field', 'destination_field', 'xml path', 'xml_path']
+                    }
+                    
+                    found = False
+                    if req_lower in alternatives:
+                        for alt in alternatives[req_lower]:
+                            if alt.lower() in column_names_lower:
+                                found = True
+                                break
+                    
+                    if not found:
+                        missing_columns.append(req_col)
+            
+            if missing_columns:
+                available_cols = ', '.join(df.columns.tolist())
+                return False, f"Missing required columns: {missing_columns}. Available columns: [{available_cols}]. Required: {required_columns}"
+            
+            # Check if there are any non-empty rows
+            if len(df.dropna(how='all')) == 0:
+                return False, "File contains no valid data rows"
+            
+            # Additional validation - check for reasonable data
+            fields_col = None
+            xml_col = None
+            
+            for col in df.columns:
+                col_lower = col.lower().strip()
+                if col_lower in ['fields', 'field', 'field_name', 'source_field', 'provider_field']:
+                    fields_col = col
+                elif col_lower in ['xml field', 'xml_field', 'target_field', 'destination_field', 'xml path', 'xml_path']:
+                    xml_col = col
+            
+            if fields_col and xml_col:
+                non_empty_rows = df[(df[fields_col].notna()) & (df[xml_col].notna()) & 
+                                   (df[fields_col] != '') & (df[xml_col] != '')]
+                if len(non_empty_rows) == 0:
+                    return False, "No rows contain valid data in both required columns"
                 
         elif file_type == "provider":
             if not (file.name.endswith('.csv') or file.name.endswith('.xlsx')):
                 return False, "Provider file must be CSV or Excel format"
+            
+            # Reset file pointer
+            file.seek(0)
+            
+            # Try to read provider file
+            try:
+                if file.name.endswith('.csv'):
+                    # Try different encodings for CSV
+                    encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+                    df = None
+                    
+                    for encoding in encodings_to_try:
+                        try:
+                            file.seek(0)
+                            df = pd.read_csv(
+                                file,
+                                encoding=encoding,
+                                sep=None,
+                                engine='python',
+                                skipinitialspace=True,
+                                na_values=['', 'NA', 'N/A', 'null', 'NULL'],
+                                keep_default_na=True
+                            )
+                            break
+                        except (UnicodeDecodeError, pd.errors.EmptyDataError):
+                            continue
+                else:
+                    df = pd.read_excel(file, engine='openpyxl')
+                
+                if df is None or df.empty:
+                    return False, "Provider file is empty or cannot be parsed"
+                    
+            except Exception as e:
+                return False, f"Error reading provider file: {str(e)}"
                 
         return True, "File is valid"
         
     except Exception as e:
+        logger.error(f"File validation error: {str(e)}")
         return False, f"File validation error: {str(e)}"
 
 # --- Main Streamlit App ---
@@ -347,12 +456,16 @@ def main():
         st.header("⚙️ Settings")
         
         # API Key management
-        api_key = st.text_input(
-            "Hugging Face API Token",
-            type="password",
-            value=st.secrets.get("HUGGINGFACE_TOKEN", ""),
-            help="Get your free token from huggingface.co/settings/tokens"
-        )
+        if "HUGGINGFACE_TOKEN" in st.secrets and st.secrets["HUGGINGFACE_TOKEN"]:
+            api_key = st.secrets["HUGGINGFACE_TOKEN"]
+            st.success("✅ API Token loaded from secrets")
+        else:
+            api_key = st.text_input(
+                "Hugging Face API Token",
+                type="password",
+                placeholder="hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                help="Get your free token from huggingface.co/settings/tokens"
+            )
         
         if not api_key:
             st.error("API token required!")
@@ -454,29 +567,118 @@ def main():
         if rag_files:
             rag_dfs = {}
             valid_files = 0
+            error_details = []
             
             for rag_file in rag_files:
+                # Reset file pointer
+                rag_file.seek(0)
+                
                 is_valid, message = validate_file(rag_file, "reference")
                 if is_valid:
                     try:
-                        rag_df = pd.read_csv(rag_file)
-                        rag_dfs[rag_file.name] = rag_df
-                        valid_files += 1
+                        # Reset file pointer again before reading
+                        rag_file.seek(0)
+                        
+                        # Enhanced CSV reading with multiple fallback options
+                        encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+                        rag_df = None
+                        
+                        for encoding in encodings_to_try:
+                            try:
+                                rag_file.seek(0)
+                                rag_df = pd.read_csv(
+                                    rag_file,
+                                    encoding=encoding,
+                                    sep=None,  # Auto-detect separator
+                                    engine='python',  # More flexible parser
+                                    skipinitialspace=True,
+                                    na_values=['', 'NA', 'N/A', 'null', 'NULL'],
+                                    keep_default_na=True,
+                                    skip_blank_lines=True
+                                )
+                                break
+                            except Exception as read_error:
+                                if encoding == encodings_to_try[-1]:  # Last attempt
+                                    error_details.append(f"{rag_file.name}: {str(read_error)}")
+                                continue
+                        
+                        if rag_df is not None and not rag_df.empty:
+                            # Clean column names
+                            rag_df.columns = rag_df.columns.str.strip()
+                            
+                            # Standardize column names to match expected format
+                            column_mapping = {}
+                            for col in rag_df.columns:
+                                col_lower = col.lower().strip()
+                                if col_lower in ['field', 'field_name', 'source_field', 'provider_field']:
+                                    column_mapping[col] = 'fields'
+                                elif col_lower in ['xml_field', 'target_field', 'destination_field', 'xml path', 'xml_path']:
+                                    column_mapping[col] = 'xml field'
+                            
+                            # Rename columns if needed
+                            if column_mapping:
+                                rag_df = rag_df.rename(columns=column_mapping)
+                            
+                            # Remove completely empty rows
+                            rag_df = rag_df.dropna(how='all')
+                            
+                            if not rag_df.empty:
+                                rag_dfs[rag_file.name] = rag_df
+                                valid_files += 1
+                            else:
+                                error_details.append(f"{rag_file.name}: File contains no valid data after cleaning")
+                        else:
+                            error_details.append(f"{rag_file.name}: Unable to read file content")
+                            
                     except Exception as e:
-                        st.error(f"Error reading {rag_file.name}: {str(e)}")
+                        error_details.append(f"{rag_file.name}: {str(e)}")
                 else:
-                    st.error(f"Invalid file {rag_file.name}: {message}")
+                    error_details.append(f"{rag_file.name}: {message}")
             
+            # Display results
             if valid_files > 0:
                 st.markdown(f'<div class="success-banner">✅ {valid_files} reference file(s) loaded successfully!</div>', unsafe_allow_html=True)
+                
+                # Show file details
+                for name, df in rag_dfs.items():
+                    st.success(f"✅ {name}: {len(df)} records, {len(df.columns)} columns")
                 
                 # Preview section
                 with st.expander("👀 Preview Reference Data", expanded=False):
                     for name, df in rag_dfs.items():
                         st.markdown(f"**{name}** ({len(df)} records)")
                         st.dataframe(df.head(3), use_container_width=True)
-            else:
-                st.error("No valid reference files uploaded!")
+                        
+                        # Show column info
+                        st.markdown("**Columns:** " + ", ".join(df.columns.tolist()))
+            
+            # Show errors if any
+            if error_details:
+                st.markdown('<div class="warning-box">⚠️ Some files could not be processed:</div>', unsafe_allow_html=True)
+                for error in error_details:
+                    st.error(f"❌ {error}")
+                
+                # Helpful tips
+                with st.expander("💡 Troubleshooting Tips", expanded=False):
+                    st.markdown("""
+                    **Common issues and solutions:**
+                    
+                    1. **Empty file**: Make sure your CSV has data rows, not just headers
+                    2. **Wrong encoding**: Try saving your CSV as UTF-8 in Excel/Google Sheets
+                    3. **Missing columns**: Your CSV must have 'fields' and 'xml field' columns (case-insensitive)
+                    4. **Wrong separator**: Make sure you're using commas (,) as separators
+                    5. **Special characters**: Avoid special characters in column names
+                    
+                    **Required CSV format:**
+                    ```
+                    fields,xml field,logic,comments
+                    provider_name,provider/name,Direct mapping,Provider company name
+                    provider_id,provider/id,Direct mapping,Unique identifier
+                    ```
+                    """)
+            
+            if valid_files == 0:
+                st.error("❌ No valid reference files could be loaded!")
                 st.stop()
         else:
             st.info("👆 Please upload at least one reference CSV file")
@@ -493,16 +695,54 @@ def main():
         )
         
         if prov_file:
+            # Reset file pointer
+            prov_file.seek(0)
+            
             is_valid, message = validate_file(prov_file, "provider")
             if not is_valid:
-                st.error(f"Invalid provider file: {message}")
+                st.error(f"❌ Invalid provider file: {message}")
                 st.stop()
             
             try:
+                # Reset file pointer again
+                prov_file.seek(0)
+                
                 if prov_file.name.endswith(".csv"):
-                    prov_df = pd.read_csv(prov_file)
+                    # Enhanced CSV reading for provider files
+                    encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+                    prov_df = None
+                    
+                    for encoding in encodings_to_try:
+                        try:
+                            prov_file.seek(0)
+                            prov_df = pd.read_csv(
+                                prov_file,
+                                encoding=encoding,
+                                sep=None,
+                                engine='python',
+                                skipinitialspace=True,
+                                na_values=['', 'NA', 'N/A', 'null', 'NULL'],
+                                keep_default_na=True
+                            )
+                            break
+                        except Exception:
+                            continue
+                    
+                    if prov_df is None:
+                        st.error("❌ Unable to read CSV file. Please check the file format.")
+                        st.stop()
                 else:
-                    prov_df = pd.read_excel(prov_file)
+                    prov_df = pd.read_excel(prov_file, engine='openpyxl')
+                
+                # Clean column names
+                prov_df.columns = prov_df.columns.str.strip()
+                
+                # Remove completely empty rows
+                prov_df = prov_df.dropna(how='all')
+                
+                if prov_df.empty:
+                    st.error("❌ Provider file contains no valid data rows.")
+                    st.stop()
                 
                 st.markdown('<div class="success-banner">✅ Provider file loaded successfully!</div>', unsafe_allow_html=True)
                 
@@ -515,12 +755,36 @@ def main():
                 with col_c:
                     st.metric("File Size", f"{prov_file.size / 1024:.1f} KB")
                 
+                # Show column information
+                st.markdown("**Detected Columns:** " + ", ".join(prov_df.columns.tolist()))
+                
                 # Preview
                 with st.expander("👀 Preview Provider Data", expanded=False):
                     st.dataframe(prov_df.head(), use_container_width=True)
                     
             except Exception as e:
-                st.error(f"Error reading provider file: {str(e)}")
+                st.error(f"❌ Error reading provider file: {str(e)}")
+                
+                # Enhanced error help
+                with st.expander("💡 File Reading Help", expanded=True):
+                    st.markdown("""
+                    **Try these solutions:**
+                    
+                    1. **For CSV files:**
+                       - Save as UTF-8 encoding in Excel
+                       - Use comma (,) as separator
+                       - Remove any special characters from headers
+                    
+                    2. **For Excel files:**
+                       - Save as .xlsx format (not .xls)
+                       - Ensure data starts from row 1
+                       - Remove any merged cells in headers
+                    
+                    3. **General tips:**
+                       - File should not be password protected
+                       - Avoid very large files (>50MB)
+                       - Check that file is not corrupted
+                    """)
                 st.stop()
         else:
             st.info("👆 Please upload a provider data file")
