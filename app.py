@@ -1,4 +1,4 @@
-# ✅ Refactored app.py with dynamic XML generation based on RAG mappings
+# ✅ Refactored app.py with dynamic XML generation based on RAG mappings + SME Reference Report
 
 import streamlit as st
 import pandas as pd
@@ -36,7 +36,6 @@ def load_custom_css():
 # --- Generic XML Builder from dynamic mapped keys ---
 def build_dynamic_xml(row: pd.Series) -> str:
     root = ET.Element("Provider")
-
     for path, value in row.items():
         if pd.isna(value) or value == "":
             continue
@@ -48,7 +47,6 @@ def build_dynamic_xml(row: pd.Series) -> str:
                 found = ET.SubElement(current, part)
             current = found
         ET.SubElement(current, parts[-1]).text = str(value)
-
     return ET.tostring(root, encoding="unicode")
 
 # --- Main App ---
@@ -59,7 +57,7 @@ def main():
     st.markdown("""
         <div class="main-header">
             <h1>🧠 HRP Smart Data Mapper</h1>
-            <p>Upload RAG mapping + provider input file → get mapped XML</p>
+            <p>Upload RAG mapping + provider input file → get mapped XML + SME audit report</p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -115,6 +113,18 @@ def main():
 
     full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n<Providers>\n' + '\n'.join([build_dynamic_xml(pd.Series(r)) for r in mapped_data]) + '\n</Providers>'
     st.download_button("📥 Download Full Mapped XML", full_xml, file_name="mapped_providers.xml", mime="application/xml")
+
+    # --- SME Reference Mapping Report ---
+    st.markdown("### 🧾 SME Mapping Reference Report")
+    audit_df = pd.DataFrame([{
+        "Mapped From (Input Column)": src,
+        "Mapped To (XML Path)": field_map[src],
+        "Logic Applied": "Direct mapping via RAG rule"
+    } for src in field_map])
+    st.dataframe(audit_df)
+
+    csv = audit_df.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Download SME Reference Report", csv, "sme_mapping_reference_report.csv", "text/csv")
 
 if __name__ == "__main__":
     main()
