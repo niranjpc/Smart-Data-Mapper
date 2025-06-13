@@ -1,4 +1,4 @@
-# ✅ Refactored app.py with RAG-based mapping + HRP production-grade XML output
+# ✅ Refactored app.py with dynamic XML generation based on RAG mappings
 
 import streamlit as st
 import pandas as pd
@@ -33,22 +33,23 @@ def load_custom_css():
     </style>
     """, unsafe_allow_html=True)
 
-# --- XML Generator ---
-def build_hrp_xml(row: pd.Series) -> str:
-    provider = ET.Element("Provider")
-    ET.SubElement(provider, "ProviderID").text = str(row.get("provider_id", ""))
-    ET.SubElement(provider, "ProviderName").text = str(row.get("provider_name", ""))
-    ET.SubElement(provider, "NPI").text = str(row.get("npi", ""))
-    ET.SubElement(provider, "TaxID").text = str(row.get("tax_id", ""))
-    address = ET.SubElement(provider, "Address")
-    ET.SubElement(address, "Street").text = str(row.get("address_line1", ""))
-    ET.SubElement(address, "City").text = str(row.get("city", ""))
-    ET.SubElement(address, "State").text = str(row.get("state", ""))
-    ET.SubElement(address, "ZipCode").text = str(row.get("zip", ""))
-    contact = ET.SubElement(provider, "Contact")
-    ET.SubElement(contact, "Phone").text = str(row.get("phone", ""))
-    ET.SubElement(contact, "Email").text = str(row.get("email", ""))
-    return ET.tostring(provider, encoding="unicode")
+# --- Generic XML Builder from dynamic mapped keys ---
+def build_dynamic_xml(row: pd.Series) -> str:
+    root = ET.Element("Provider")
+
+    for path, value in row.items():
+        if pd.isna(value) or value == "":
+            continue
+        parts = path.strip().split("/")
+        current = root
+        for part in parts[:-1]:
+            found = current.find(part)
+            if found is None:
+                found = ET.SubElement(current, part)
+            current = found
+        ET.SubElement(current, parts[-1]).text = str(value)
+
+    return ET.tostring(root, encoding="unicode")
 
 # --- Main App ---
 def main():
@@ -101,17 +102,18 @@ def main():
         xml_row = {}
         for col in prov_df.columns:
             if col in field_map:
-                xml_row[field_map[col]] = row[col]
+                xml_path = field_map[col]
+                xml_row[xml_path] = row[col]
         mapped_data.append(xml_row)
 
     st.markdown("### 🔍 Sample Transformed XML Output")
     sample_df = pd.DataFrame(mapped_data)
     for i in range(min(3, len(sample_df))):
-        xml = build_hrp_xml(sample_df.iloc[i])
+        xml = build_dynamic_xml(sample_df.iloc[i])
         st.markdown(f"#### Provider {i+1}")
         st.markdown(f"<div class='xml-box'>{xml}</div>", unsafe_allow_html=True)
 
-    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n<Providers>\n' + '\n'.join([build_hrp_xml(pd.Series(r)) for r in mapped_data]) + '\n</Providers>'
+    full_xml = '<?xml version="1.0" encoding="UTF-8"?>\n<Providers>\n' + '\n'.join([build_dynamic_xml(pd.Series(r)) for r in mapped_data]) + '\n</Providers>'
     st.download_button("📥 Download Full Mapped XML", full_xml, file_name="mapped_providers.xml", mime="application/xml")
 
 if __name__ == "__main__":
