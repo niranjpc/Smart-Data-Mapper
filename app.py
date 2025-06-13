@@ -86,9 +86,10 @@ def main():
         st.stop()
 
     try:
-        rag_df = pd.read_csv(rag_file)
+        import csv
+        rag_df = pd.read_csv(rag_file, quoting=csv.QUOTE_MINIMAL, on_bad_lines='skip')
         if prov_file.name.endswith(".csv"):
-            prov_df = pd.read_csv(prov_file)
+            prov_df = pd.read_csv(prov_file, quoting=csv.QUOTE_MINIMAL, on_bad_lines='skip')
         else:
             prov_df = pd.read_excel(prov_file)
     except Exception as e:
