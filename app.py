@@ -1,50 +1,20 @@
 import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
-from difflib import SequenceMatcher
+import requests
 
-# --- Helper Functions ---
-
-def text_similarity(text1, text2):
-    return SequenceMatcher(None, str(text1).lower(), str(text2).lower()).ratio()
-
-def find_best_match(provider_column, rag_dfs):
-    """Find the best matching RAG field for a provider column across multiple reference data files."""
-    best_score = 0
-    best_row = None
-    best_rag_file = ""
-    provider_str = str(provider_column) if pd.notna(provider_column) else ""
-    def safe_words(val):
-        try:
-            return set(str(val).lower().split())
-        except Exception:
-            return set()
-    for rag_file, rag_df in rag_dfs.items():
-        for _, row in rag_df.iterrows():
-            rag_field = row['fields']
-            rag_str = str(rag_field) if pd.notna(rag_field) else ""
-            score = text_similarity(provider_str, rag_str)
-            provider_words = safe_words(provider_str)
-            rag_words = safe_words(rag_str)
-            common_words = provider_words.intersection(rag_words)
-            if common_words:
-                score += 0.05
-            score = min(score, 1.0)
-            if score > best_score:
-                best_score = score
-                best_row = row
-                best_rag_file = rag_file
-    return best_row, best_score, best_rag_file
-
-def generate_simple_explanation(provider_field, xml_field, similarity_score, logic, comments, rag_file):
-    base = (
-        f"Field '{provider_field}' was mapped to XML field '{xml_field}' "
-        f"from reference file '{rag_file}' with {similarity_score:.2%} confidence. "
-        f"Logic: {logic}. Comments: {comments}"
-    )
-    if similarity_score < 0.5:
-        base += " ⚠️ Low confidence: Please review this mapping."
-    return base
+# --- Gemini API Helper ---
+def gemini_generate(prompt, api_key):
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent"
+    headers = {"Content-Type": "application/json"}
+    params = {"key": api_key}
+    data = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+    response = requests.post(url, headers=headers, params=params, json=data)
+    response.raise_for_status()
+    result = response.json()
+    return result["candidates"][0]["content"]["parts"][0]["text"]
 
 def build_xml(provider_data):
     provider_el = ET.Element("provider")
@@ -61,32 +31,24 @@ def build_xml(provider_data):
         ET.SubElement(current, parts[-1]).text = str(val)
     return ET.tostring(provider_el, encoding="unicode")
 
-# --- Sleek Streamlit UI ---
-
-st.set_page_config(page_title="Smart Data Mapper", layout="wide")
-st.markdown(
-    """
-    <style>
-    .stButton>button {background-color:#4F8BF9;color:white;font-weight:bold;}
-    .stProgress>div>div>div>div {background-color: #4F8BF9;}
-    .confidence-high {color: #228B22; font-weight: bold;}
-    .confidence-medium {color: #E6B800; font-weight: bold;}
-    .confidence-low {color: #D7263D; font-weight: bold;}
-    </style>
-    """, unsafe_allow_html=True
-)
-
-st.title("🧠 Smart Data Mapper")
-st.caption("A modern, AI-inspired tool for mapping provider data to reference XML structures.")
+# --- Streamlit UI ---
+st.set_page_config(page_title="Smart Data Mapper (Gemini)", layout="wide")
+st.title("🧠 Smart Data Mapper (Gemini-powered)")
+st.caption("Upload reference data and a file to be mapped. Gemini will intelligently map, transform, and explain each field.")
 
 with st.expander("ℹ️ How to use this tool", expanded=True):
     st.markdown("""
     1. **Upload one or more reference data files** (your mapping CSVs).
     2. **Upload the file to be mapped** (your provider data).
     3. **Click 'Process Mapping'** to see a smart preview, download a mapping report, and get your XML output.
-    - Confidence scores are color-coded for quick review.
-    - Low-confidence matches are flagged for your attention.
+    - Gemini will use your reference data, logic, and comments to make the best mapping.
     """)
+
+# Get Gemini API key from secrets
+api_key = st.secrets.get("GEMINI_API_KEY", "")
+if not api_key:
+    st.error("Please add your Gemini API key to Streamlit secrets as GEMINI_API_KEY.")
+    st.stop()
 
 st.divider()
 
@@ -137,7 +99,7 @@ st.divider()
 
 # Process Mapping
 if st.button("🚀 Process Mapping", use_container_width=True):
-    st.info("Processing mappings using text similarity...")
+    st.info("Gemini is mapping and transforming your data. This may take a moment...")
 
     try:
         prov_columns = prov_df.columns.astype(str).tolist()
@@ -146,31 +108,60 @@ if st.button("🚀 Process Mapping", use_container_width=True):
         mapping_explanations = []
         mapping_report_rows = []
 
+        # Prepare reference context for Gemini
+        reference_context = []
+        for rag_file, rag_df in rag_dfs.items():
+            for _, row in rag_df.iterrows():
+                reference_context.append(
+                    f"Field: {row['fields']}, XML: {row['xml field']}, Logic: {row.get('logic','')}, Comments: {row.get('comments','')}, Source: {rag_file}"
+                )
+        reference_context_str = "\n".join(reference_context)
+
         # Preview and mapping logic
         for col in prov_columns:
-            best_row, similarity, rag_file = find_best_match(col, rag_dfs)
-            xml_path = best_row['xml field']
-            logic = best_row.get('logic', '')
-            comments = best_row.get('comments', '')
-            # Color code confidence
-            if similarity >= 0.85:
-                conf_class = "confidence-high"
-            elif similarity >= 0.65:
-                conf_class = "confidence-medium"
-            else:
-                conf_class = "confidence-low"
+            # Compose prompt for Gemini
+            prompt = (
+                f"You are a US healthcare data mapping expert. "
+                f"Given the following reference data fields and mapping logic:\n{reference_context_str}\n\n"
+                f"Map the provider field '{col}' to the best XML field. "
+                f"Explain your reasoning, apply any transformation logic, and provide the XML path. "
+                f"Return your answer in this format:\n"
+                f"XML Field: <xml_path>\n"
+                f"Logic: <logic_applied>\n"
+                f"Comments: <comments>\n"
+                f"Confidence: <confidence 0-100%>\n"
+                f"Explanation: <explanation>"
+            )
+            gemini_response = gemini_generate(prompt, api_key)
+            # Parse Gemini's response (simple parsing)
+            xml_field = ""
+            logic = ""
+            comments = ""
+            confidence = ""
+            explanation = ""
+            for line in gemini_response.splitlines():
+                if line.lower().startswith("xml field:"):
+                    xml_field = line.split(":",1)[1].strip()
+                elif line.lower().startswith("logic:"):
+                    logic = line.split(":",1)[1].strip()
+                elif line.lower().startswith("comments:"):
+                    comments = line.split(":",1)[1].strip()
+                elif line.lower().startswith("confidence:"):
+                    confidence = line.split(":",1)[1].strip()
+                elif line.lower().startswith("explanation:"):
+                    explanation = line.split(":",1)[1].strip()
             mapping_preview.append({
                 'Provider Field': col,
-                'XML Field': xml_path,
+                'XML Field': xml_field,
                 'Logic': logic,
                 'Comments': comments,
-                'Confidence': f"<span class='{conf_class}'>{similarity:.2%}</span>" + (" ⚠️" if similarity < 0.5 else ""),
-                'Reference File': rag_file
+                'Confidence': confidence,
+                'Explanation': explanation
             })
 
         st.subheader("📋 Field Mappings Preview")
         preview_df = pd.DataFrame(mapping_preview)
-        st.write(preview_df.to_html(escape=False, index=False), unsafe_allow_html=True)
+        st.dataframe(preview_df)
 
         progress_bar = st.progress(0)
         total_rows = len(prov_df)
@@ -179,23 +170,21 @@ if st.button("🚀 Process Mapping", use_container_width=True):
             entry = {}
             explain = {}
             for col in prov_df.columns:
-                best_row, similarity, rag_file = find_best_match(col, rag_dfs)
-                xml_path = best_row['xml field']
-                logic = best_row.get('logic', '')
-                comments = best_row.get('comments', '')
+                # Use the mapping from preview
+                mapping = next((m for m in mapping_preview if m['Provider Field'] == col), None)
+                xml_path = mapping['XML Field'] if mapping else col
                 value = row[col]
                 entry[xml_path] = value
-                explanation = generate_simple_explanation(col, xml_path, similarity, logic, comments, rag_file)
+                explanation = mapping['Explanation'] if mapping else ""
                 explain[col] = explanation
                 mapping_report_rows.append({
                     'Provider Row': i+1,
                     'Provider Field': col,
                     'Value': value,
                     'XML Field': xml_path,
-                    'Logic': logic,
-                    'Comments': comments,
-                    'Confidence': f"{similarity:.2%}" + (" ⚠️" if similarity < 0.5 else ""),
-                    'Reference File': rag_file,
+                    'Logic': mapping['Logic'] if mapping else "",
+                    'Comments': mapping['Comments'] if mapping else "",
+                    'Confidence': mapping['Confidence'] if mapping else "",
                     'Explanation': explanation
                 })
             results.append(entry)
@@ -233,24 +222,7 @@ if st.button("🚀 Process Mapping", use_container_width=True):
             mime="text/csv"
         )
 
-        st.success("✅ Processing completed using text similarity matching!")
-
-        st.markdown("#### Example XML Output (for one provider):")
-        st.code(
-            '''<provider>
-    <npi>1234567890</npi>
-    <name>
-        <first>John</first>
-        <last>Doe</last>
-    </name>
-    <dob>1980-01-01</dob>
-    <specialty>Cardiology</specialty>
-    <license>
-        <number>AB12345</number>
-        <state>CA</state>
-    </license>
-</provider>''', language="xml"
-        )
+        st.success("✅ Processing completed using Gemini-powered mapping!")
 
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
@@ -264,8 +236,7 @@ st.markdown("- [sample_provider_input.csv](https://github.com/niranjpc/provider-
 st.markdown("---")
 st.markdown("🔧 **How it works:**")
 st.markdown("""
+- Uses Google Gemini 1.5 Pro for intelligent mapping, logic, and explanations
 - Supports multiple reference data files
-- Shows a detailed mapping preview with logic, comments, and confidence (color-coded)
 - Lets you download a mapping report (CSV) and the generated XML
-- Uses Python's built-in text similarity algorithms (no API required)
 """)
