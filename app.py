@@ -1,4 +1,4 @@
-# ✅ Refactored app.py with dynamic XML generation based on RAG mappings + SME Reference Report
+# ✅ Refactored app.py with enhanced SME-aware AI mapping using reference data
 
 import streamlit as st
 import pandas as pd
@@ -17,19 +17,20 @@ logger = logging.getLogger(__name__)
 
 # --- Custom Styling ---
 def load_custom_css():
-    st.markdown("""
+    st.markdown(f"""
     <style>
-    .main-header {
+    .main-header {{
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 2rem;
         border-radius: 10px;
         margin-bottom: 2rem;
         text-align: center;
         color: white;
-    }
-    .main-header h1 { font-size: 2.5rem; font-weight: 700; }
-    .main-header p { font-size: 1.2rem; margin: 0; }
-    .xml-box { background-color: #f5f5f5; padding: 1rem; border-radius: 10px; margin-top: 1rem; font-family: monospace; white-space: pre-wrap; }
+    }}
+    .main-header h1 {{ font-size: 2.5rem; font-weight: 700; }}
+    .main-header p {{ font-size: 1.1rem; margin: 0.5rem 0; }}
+    .main-header small {{ font-size: 0.9rem; display: block; margin-top: 0.5rem; color: #f0f0f0; }}
+    .xml-box {{ background-color: #f5f5f5; padding: 1rem; border-radius: 10px; margin-top: 1rem; font-family: monospace; white-space: pre-wrap; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -51,18 +52,31 @@ def build_dynamic_xml(row: pd.Series) -> str:
 
 # --- Main App ---
 def main():
-    st.set_page_config(page_title="HRP Smart Data Mapper", layout="wide")
+    st.set_page_config(page_title="HRP AI Data Mapper", layout="wide")
     load_custom_css()
 
-    st.markdown("""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    st.markdown(f"""
         <div class="main-header">
-            <h1>🧠 HRP Smart Data Mapper</h1>
-            <p>Upload RAG mapping + provider input file → get mapped XML + SME audit report</p>
+            <h1>🤖 HRP AI Data Mapper</h1>
+            <p>Upload your reference mapping & provider data to generate HRP-compliant XML files with AI-guided transformation.</p>
+            <small>🗓️ {now}</small>
         </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("### 📁 Step 1: Upload RAG Mapping File (CSV with 'fields' and 'xml field')")
-    rag_file = st.file_uploader("RAG Mapping File", type=["csv"], key="rag")
+    st.markdown("""
+    ## 📖 Features
+    - ✅ Upload reference data (CSV) with mapping logic from SMEs
+    - ✅ Upload provider file (CSV/XLSX)
+    - ✅ Get auto-transformed provider data to HRP-compliant XML
+    - ✅ Preview real XML structure in-browser
+    - ✅ Download full XML
+    - ✅ Download SME mapping audit report
+    """)
+
+    st.markdown("### 📁 Step 1: Upload Reference Data File (CSV with 'fields', 'xml field', 'mapping_type', 'logic_applied')")
+    rag_file = st.file_uploader("Reference Mapping File", type=["csv"], key="rag")
 
     st.markdown("### 📄 Step 2: Upload Provider Input File")
     prov_file = st.file_uploader("Provider Input File", type=["csv", "xlsx"], key="provider")
@@ -83,17 +97,27 @@ def main():
 
     st.success("✅ Files loaded successfully")
     st.markdown("---")
-    st.markdown("### 🧠 Field Mapping Based on RAG")
+    st.markdown("### 🧠 AI-Guided Field Mapping using Reference Data")
 
     rag_df.columns = rag_df.columns.str.strip().str.lower()
     prov_df.columns = prov_df.columns.str.strip()
 
     field_map = {}
+    audit_rows = []
+
     for _, row in rag_df.iterrows():
         src = row.get("fields")
         tgt = row.get("xml field")
+        mtype = row.get("mapping_type", "Direct")
+        logic = row.get("logic_applied", "")
         if pd.notna(src) and pd.notna(tgt):
             field_map[str(src).strip()] = str(tgt).strip()
+            audit_rows.append({
+                "Mapped From (Input Column)": src,
+                "Mapped To (XML Path)": tgt,
+                "Mapping Type": mtype,
+                "Logic Applied": logic
+            })
 
     mapped_data = []
     for _, row in prov_df.iterrows():
@@ -116,11 +140,7 @@ def main():
 
     # --- SME Reference Mapping Report ---
     st.markdown("### 🧾 SME Mapping Reference Report")
-    audit_df = pd.DataFrame([{
-        "Mapped From (Input Column)": src,
-        "Mapped To (XML Path)": field_map[src],
-        "Logic Applied": "Direct mapping via RAG rule"
-    } for src in field_map])
+    audit_df = pd.DataFrame(audit_rows)
     st.dataframe(audit_df)
 
     csv = audit_df.to_csv(index=False).encode("utf-8")
