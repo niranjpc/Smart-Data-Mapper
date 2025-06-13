@@ -7,7 +7,7 @@ import time
 
 # --- Hugging Face API Helpers ---
 def get_embeddings(texts, api_key):
-    url = "https://api-inference.huggingface.co/pipeline/feature-extraction/thenlper/gte-small"
+    url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
     headers = {"Authorization": f"Bearer {api_key}"}
     response = requests.post(url, headers=headers, json={"inputs": texts, "options": {"wait_for_model": True}})
     if response.status_code != 200:
