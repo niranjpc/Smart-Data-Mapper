@@ -1,21 +1,42 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import xml.etree.ElementTree as ET
 import requests
 import time
 
-# --- Gemini API Helper ---
-def gemini_generate(prompt, api_key):
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent"
-    headers = {"Content-Type": "application/json"}
-    params = {"key": api_key}
-    data = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
-    response = requests.post(url, headers=headers, params=params, json=data)
-    response.raise_for_status()
-    result = response.json()
-    return result["candidates"][0]["content"]["parts"][0]["text"]
+# --- Hugging Face API Helpers ---
+def get_embeddings(texts, api_key):
+    url = "https://api-inference.huggingface.co/pipeline/feature-extraction/thenlper/gte-small"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    response = requests.post(url, headers=headers, json={"inputs": texts, "options": {"wait_for_model": True}})
+    if response.status_code != 200:
+        st.error(f"Embedding API error {response.status_code}: {response.text}")
+        st.stop()
+    return response.json()
+
+def cosine_similarity(vec1, vec2):
+    vec1 = np.array(vec1)
+    vec2 = np.array(vec2)
+    return float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+
+def generate_text(prompt, api_key):
+    url = "https://api-inference.huggingface.co/models/google/flan-t5-small"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 80, "temperature": 0.3, "return_full_text": False}}
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        result = response.json()
+        if isinstance(result, list) and len(result) > 0 and 'generated_text' in result[0]:
+            return result[0]['generated_text'].strip()
+        else:
+            return f"[Error: Unexpected API response format: {result}]"
+    elif response.status_code == 503:
+        st.warning("Text generation model is loading. Retrying in a moment...")
+        time.sleep(10)
+        return generate_text(prompt, api_key)
+    else:
+        return f"[API Error: {response.status_code} - {response.text}]"
 
 def build_xml(provider_data):
     provider_el = ET.Element("provider")
@@ -33,22 +54,22 @@ def build_xml(provider_data):
     return ET.tostring(provider_el, encoding="unicode")
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="Smart Data Mapper (Gemini)", layout="wide")
-st.title("🧠 Smart Data Mapper (Gemini-powered)")
-st.caption("Upload reference data and a file to be mapped. Gemini will intelligently map, transform, and explain each field.")
+st.set_page_config(page_title="Smart Data Mapper (Hugging Face)", layout="wide")
+st.title("🧠 Smart Data Mapper (Hugging Face-powered)")
+st.caption("Upload reference data and a file to be mapped. The app will use semantic AI for mapping, logic, and explanations.")
 
 with st.expander("ℹ️ How to use this tool", expanded=True):
     st.markdown("""
     1. **Upload one or more reference data files** (your mapping CSVs).
     2. **Upload the file to be mapped** (your provider data).
     3. **Click 'Process Mapping'** to see a smart preview, download a mapping report, and get your XML output.
-    - Gemini will use your reference data, logic, and comments to make the best mapping.
+    - The app uses Hugging Face's best free models for semantic mapping and logic.
     """)
 
-# Get Gemini API key from secrets
-api_key = st.secrets.get("GEMINI_API_KEY", "")
+# Get Hugging Face API key from secrets
+api_key = st.secrets.get("HUGGINGFACE_TOKEN", "")
 if not api_key:
-    st.error("Please add your Gemini API key to Streamlit secrets as GEMINI_API_KEY.")
+    st.error("Please add your Hugging Face API key to Streamlit secrets as HUGGINGFACE_TOKEN.")
     st.stop()
 
 st.divider()
@@ -100,7 +121,7 @@ st.divider()
 
 # Process Mapping
 if st.button("🚀 Process Mapping", use_container_width=True):
-    st.info("Gemini is mapping and transforming your data. This may take a moment...")
+    st.info("Processing with Hugging Face models. This may take a moment...")
 
     try:
         prov_columns = prov_df.columns.astype(str).tolist()
@@ -109,60 +130,56 @@ if st.button("🚀 Process Mapping", use_container_width=True):
         mapping_explanations = []
         mapping_report_rows = []
 
-        # Prepare reference context for Gemini
-        reference_context = []
+        # Prepare all reference fields for embeddings
+        reference_rows = []
         for rag_file, rag_df in rag_dfs.items():
             for _, row in rag_df.iterrows():
-                reference_context.append(
-                    f"Field: {row['fields']}, XML: {row['xml field']}, Logic: {row.get('logic','')}, Comments: {row.get('comments','')}, Source: {rag_file}"
-                )
-        reference_context_str = "\n".join(reference_context)
+                reference_rows.append({
+                    "fields": str(row['fields']),
+                    "xml field": str(row['xml field']),
+                    "logic": str(row.get('logic', '')),
+                    "comments": str(row.get('comments', '')),
+                    "rag_file": rag_file
+                })
+        reference_fields = [r["fields"] for r in reference_rows]
 
-        # --- Gemini batching and caching ---
-        gemini_cache = {}
-        for col in prov_columns:
-            if col in gemini_cache:
-                gemini_response = gemini_cache[col]
-            else:
-                prompt = (
-                    f"You are a US healthcare data mapping expert. "
-                    f"Given the following reference data fields and mapping logic:\n{reference_context_str}\n\n"
-                    f"Map the provider field '{col}' to the best XML field. "
-                    f"Explain your reasoning, apply any transformation logic, and provide the XML path. "
-                    f"Return your answer in this format:\n"
-                    f"XML Field: <xml_path>\n"
-                    f"Logic: <logic_applied>\n"
-                    f"Comments: <comments>\n"
-                    f"Confidence: <confidence 0-100%>\n"
-                    f"Explanation: <explanation>"
-                )
-                gemini_response = gemini_generate(prompt, api_key)
-                gemini_cache[col] = gemini_response
-                time.sleep(1)  # Delay to avoid rate limit
+        # Get embeddings for reference fields (batch)
+        st.info("Getting embeddings for reference fields...")
+        ref_embeddings = get_embeddings(reference_fields, api_key)
 
-            # Parse Gemini's response (simple parsing)
-            xml_field = ""
-            logic = ""
-            comments = ""
-            confidence = ""
-            explanation = ""
-            for line in gemini_response.splitlines():
-                if line.lower().startswith("xml field:"):
-                    xml_field = line.split(":",1)[1].strip()
-                elif line.lower().startswith("logic:"):
-                    logic = line.split(":",1)[1].strip()
-                elif line.lower().startswith("comments:"):
-                    comments = line.split(":",1)[1].strip()
-                elif line.lower().startswith("confidence:"):
-                    confidence = line.split(":",1)[1].strip()
-                elif line.lower().startswith("explanation:"):
-                    explanation = line.split(":",1)[1].strip()
+        # Get embeddings for provider columns (batch)
+        st.info("Getting embeddings for provider fields...")
+        prov_embeddings = get_embeddings(prov_columns, api_key)
+
+        # For each provider field, find best match in reference fields
+        for idx, col in enumerate(prov_columns):
+            prov_emb = prov_embeddings[idx]
+            best_score = -1
+            best_idx = -1
+            for j, ref_emb in enumerate(ref_embeddings):
+                score = cosine_similarity(prov_emb, ref_emb)
+                if score > best_score:
+                    best_score = score
+                    best_idx = j
+            best_ref = reference_rows[best_idx]
+            xml_path = best_ref["xml field"]
+            logic = best_ref["logic"]
+            comments = best_ref["comments"]
+            rag_file = best_ref["rag_file"]
+            confidence = f"{best_score*100:.2f}%"
+            # Generate explanation using text generation model
+            prompt = (
+                f"Explain why the provider field '{col}' should be mapped to XML field '{xml_path}'. "
+                f"Mapping logic: {logic}. Comments: {comments}."
+            )
+            explanation = generate_text(prompt, api_key)
             mapping_preview.append({
                 'Provider Field': col,
-                'XML Field': xml_field,
+                'XML Field': xml_path,
                 'Logic': logic,
                 'Comments': comments,
                 'Confidence': confidence,
+                'Reference File': rag_file,
                 'Explanation': explanation
             })
 
@@ -191,6 +208,7 @@ if st.button("🚀 Process Mapping", use_container_width=True):
                     'Logic': mapping['Logic'] if mapping else "",
                     'Comments': mapping['Comments'] if mapping else "",
                     'Confidence': mapping['Confidence'] if mapping else "",
+                    'Reference File': mapping['Reference File'] if mapping else "",
                     'Explanation': explanation
                 })
             results.append(entry)
@@ -228,7 +246,7 @@ if st.button("🚀 Process Mapping", use_container_width=True):
             mime="text/csv"
         )
 
-        st.success("✅ Processing completed using Gemini-powered mapping!")
+        st.success("✅ Processing completed using Hugging Face-powered mapping!")
 
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
@@ -242,7 +260,7 @@ st.markdown("- [sample_provider_input.csv](https://github.com/niranjpc/provider-
 st.markdown("---")
 st.markdown("🔧 **How it works:**")
 st.markdown("""
-- Uses Google Gemini 1.5 Pro for intelligent mapping, logic, and explanations
+- Uses Hugging Face's best free models for semantic mapping and logic
 - Supports multiple reference data files
 - Lets you download a mapping report (CSV) and the generated XML
 """)
