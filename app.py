@@ -1,21 +1,21 @@
-# Intelligent HRP AI Data Mapper with Hugging Face Integration + Manual + Heuristic Fallback
-# --- Imports ---
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
-import io
-import traceback
+from typing import List, Dict, Any, Tuple
 import logging
 from datetime import datetime
-from difflib import SequenceMatcher
+import io
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
-import requests
-from typing import List, Dict, Tuple, Any
+import re
+import traceback
+from difflib import SequenceMatcher
 
-# --- Logging ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# --- Enhanced Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
@@ -24,173 +24,656 @@ class Config:
     XML_INDENT = "  "
     SUPPORTED_FORMATS = ["csv", "xlsx", "xls"]
     DEFAULT_ENCODING = "utf-8"
-    MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
-    SIMILARITY_THRESHOLD = 0.6
-    HF_API_KEY = "hf_your_key_here"  # Replace with your actual Hugging Face API key
-    HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
-    API_OPTIONS = ["FacilityLoad", "PractitionerLoad", "MemberLoad"]
-    ENABLE_MANUAL_MAPPING = True
-    ENABLE_LLM_MAPPING = True
-    ENABLE_SIMILARITY_FALLBACK = True
+    MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB limit
+    SIMILARITY_THRESHOLD = 0.6  # Minimum similarity for auto-mapping
 
-# --- Utility Functions ---
-def calculate_similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+# --- Intelligent Column Detection ---
+class ColumnDetector:
+    """Intelligent column detection and mapping logic"""
+    SOURCE_PATTERNS = [
+        r'\b(field|column|source|input|provider|data)[\s_-]*(name|field|col)?\b',
+        r'\b(original|raw|src)[\s_-]*(field|column)?\b',
+        r'\bfrom[\s_-]*(field|column)?\b'
+    ]
+    TARGET_PATTERNS = [
+        r'\b(xml|target|destination|output|hrp)[\s_-]*(field|path|element)?\b',
+        r'\b(mapped|transformed|converted)[\s_-]*(to|field)?\b',
+        r'\bto[\s_-]*(field|column|xml)?\b'
+    ]
+    TYPE_PATTERNS = [
+        r'\b(type|kind|method|mapping[\s_-]*type)\b',
+        r'\b(transform|conversion|logic)[\s_-]*(type|method)?\b'
+    ]
+    LOGIC_PATTERNS = [
+        r'\b(logic|rule|description|note|comment)\b',
+        r'\b(applied|transformation|instruction)\b',
+        r'\b(how|what|why|when)[\s_-]*(to|apply)?\b'
+    ]
+    @staticmethod
+    def calculate_similarity(text1: str, text2: str) -> float:
+        return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+    @classmethod
+    def detect_column_type(cls, column_name: str, sample_values: List[str]) -> str:
+        col_lower = column_name.lower().strip()
+        for pattern in cls.SOURCE_PATTERNS:
+            if re.search(pattern, col_lower, re.IGNORECASE):
+                return 'source'
+        for pattern in cls.TARGET_PATTERNS:
+            if re.search(pattern, col_lower, re.IGNORECASE):
+                return 'target'
+        for pattern in cls.TYPE_PATTERNS:
+            if re.search(pattern, col_lower, re.IGNORECASE):
+                return 'type'
+        for pattern in cls.LOGIC_PATTERNS:
+            if re.search(pattern, col_lower, re.IGNORECASE):
+                return 'logic'
+        if sample_values:
+            xml_path_count = sum(1 for val in sample_values[:10] if isinstance(val, str) and ('/' in val or '<' in val))
+            if xml_path_count > len(sample_values) * 0.3:
+                return 'target'
+        return 'unknown'
+    @classmethod
+    def auto_detect_columns(cls, df: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, str]]:
+        column_mapping = {}
+        detected_types = {}
+        for col in df.columns:
+            sample_values = df[col].dropna().astype(str).tolist()[:20]
+            col_type = cls.detect_column_type(col, sample_values)
+            detected_types[col] = col_type
+        source_candidates = [col for col, typ in detected_types.items() if typ == 'source']
+        target_candidates = [col for col, typ in detected_types.items() if typ == 'target']
+        type_candidates = [col for col, typ in detected_types.items() if typ == 'type']
+        logic_candidates = [col for col, typ in detected_types.items() if typ == 'logic']
+        if not source_candidates:
+            source_candidates = cls._find_similar_columns(df.columns, ['fields', 'field', 'source', 'column', 'provider', 'input'])
+        if not target_candidates:
+            target_candidates = cls._find_similar_columns(df.columns, ['xml', 'target', 'output', 'destination', 'hrp', 'mapped'])
+        if not type_candidates:
+            type_candidates = cls._find_similar_columns(df.columns, ['type', 'mapping_type', 'method', 'transform'])
+        if not logic_candidates:
+            logic_candidates = cls._find_similar_columns(df.columns, ['logic', 'rule', 'description', 'note', 'applied'])
+        if source_candidates:
+            column_mapping['source'] = source_candidates[0]
+        if target_candidates:
+            column_mapping['target'] = target_candidates[0]
+        if type_candidates:
+            column_mapping['type'] = type_candidates[0]
+        if logic_candidates:
+            column_mapping['logic'] = logic_candidates[0]
+        return column_mapping, detected_types
+    @classmethod
+    def _find_similar_columns(cls, columns: List[str], reference_terms: List[str]) -> List[str]:
+        matches = []
+        for col in columns:
+            col_lower = col.lower().strip()
+            for term in reference_terms:
+                if cls.calculate_similarity(col_lower, term) >= Config.SIMILARITY_THRESHOLD:
+                    matches.append((col, cls.calculate_similarity(col_lower, term)))
+                    break
+        matches.sort(key=lambda x: x[1], reverse=True)
+        return [match[0] for match in matches]
 
-# --- LLM Functions ---
-def call_hf_llm(prompt: str, max_tokens: int = 200) -> str:
-    url = f"https://api-inference.huggingface.co/models/{Config.HF_MODEL}"
-    headers = {"Authorization": f"Bearer {Config.HF_API_KEY}"}
-    payload = {"inputs": prompt, "max_new_tokens": max_tokens}
+def load_custom_css():
     try:
-        response = requests.post(url, headers=headers, json=payload)
-        result = response.json()
-        return result[0].get("generated_text", "").strip()
+        st.markdown("""
+        <style>
+        .main-header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 2rem; border-radius: 15px; margin-bottom: 2rem; text-align: center; color: white; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
+        .main-header h1 { font-size: 2.8rem; font-weight: 700; margin-bottom: 0.5rem; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
+        .main-header p { font-size: 1.2rem; margin: 0.5rem 0; opacity: 0.95; }
+        .main-header small { font-size: 0.9rem; display: block; margin-top: 1rem; color: #e8e8e8; opacity: 0.8; }
+        .xml-preview { background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); border: 2px solid #dee2e6; border-radius: 10px; padding: 1.5rem; margin: 1rem 0; font-family: 'Courier New', monospace; font-size: 0.9rem; white-space: pre-wrap; overflow-x: auto; box-shadow: inset 0 1px 3px rgba(0,0,0,0.1); max-height: 400px; overflow-y: auto; }
+        .stats-container { background: linear-gradient(135deg, #28a745 0%, #20c997 100%); color: white; padding: 1rem; border-radius: 10px; margin: 1rem 0; text-align: center; }
+        .warning-box { background: linear-gradient(135deg, #ffc107 0%, #fd7e14 100%); color: white; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
+        .success-box { background: linear-gradient(135deg, #28a745 0%, #20c997 100%); color: white; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
+        .error-box { background: linear-gradient(135deg, #dc3545 0%, #c82333 100%); color: white; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
+        .info-box { background: linear-gradient(135deg, #17a2b8 0%, #138496 100%); color: white; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
+        .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; margin: 1rem 0; }
+        .feature-card { background: white; border: 1px solid #dee2e6; border-radius: 10px; padding: 1rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .step-header { background: linear-gradient(135deg, #6c757d 0%, #495057 100%); color: white; padding: 0.8rem 1.2rem; border-radius: 8px; margin: 1.5rem 0 1rem 0; font-weight: 600; }
+        .detection-result { background: #f8f9fa; border-left: 4px solid #007bff; padding: 1rem; margin: 0.5rem 0; border-radius: 0 8px 8px 0; }
+        </style>
+        """, unsafe_allow_html=True)
     except Exception as e:
-        logger.error(f"HF LLM Error: {e}")
-        return ""
-
-def llm_map_field_to_xml(source_field: str, xml_candidates: List[str]) -> str:
-    prompt = f"""
-You are a healthcare data mapping expert.
-
-Field to map: "{source_field}"
-Choose the best matching XML path from below:
-{chr(10).join(f"- {x}" for x in xml_candidates)}
-
-Only reply with the best matching XML path.
-"""
-    return call_hf_llm(prompt)
-
-def llm_explain_mapping(source_field: str, target_field: str) -> str:
-    prompt = f"""
-Explain the mapping logic from "{source_field}" to XML path "{target_field}" in a healthcare context.
-Include whether it is direct, conditional, lookup, formatting, or calculation based.
-"""
-    return call_hf_llm(prompt)
-
-# --- XML Builder ---
-def build_dynamic_xml(row: pd.Series, pretty_print: bool = False, root_name: str = "HealthcareData") -> str:
+        logger.error(f"Error loading CSS: {e}")
+        st.error("CSS loading failed, but the app will continue to work.")
+def build_dynamic_xml(row: pd.Series, pretty_print: bool = False) -> str:
     try:
-        root = ET.Element(root_name)
+        root = ET.Element("Provider")
         for path, value in row.items():
-            if pd.isna(value) or not path:
+            if pd.isna(value) or value == "" or value is None:
                 continue
-            parts = [part.strip() for part in path.split("/") if part.strip()]
+            path_clean = str(path).strip()
+            if not path_clean:
+                continue
+            parts = [part.strip() for part in path_clean.split("/") if part.strip()]
+            if not parts:
+                continue
             current = root
             for part in parts[:-1]:
-                child = current.find(part)
-                if child is None:
-                    child = ET.SubElement(current, part)
-                current = child
-            ET.SubElement(current, parts[-1]).text = str(value)
-        rough_string = ET.tostring(root, encoding='unicode')
+                part_clean = re.sub(r'[^a-zA-Z0-9_-]', '_', str(part))
+                if not part_clean or part_clean[0].isdigit():
+                    part_clean = f"element_{part_clean}"
+                part_clean = part_clean[:50]
+                found = current.find(part_clean)
+                if found is None:
+                    found = ET.SubElement(current, part_clean)
+                current = found
+            final_part = re.sub(r'[^a-zA-Z0-9_-]', '_', str(parts[-1]))
+            if not final_part or final_part[0].isdigit():
+                final_part = f"element_{final_part}"
+            final_part = final_part[:50]
+            value_str = str(value).strip()
+            value_str = value_str.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            value_str = value_str.replace('"', '&quot;').replace("'", '&apos;')
+            if value_str and len(value_str) <= 1000:
+                ET.SubElement(current, final_part).text = value_str
         if pretty_print:
-            return minidom.parseString(rough_string).toprettyxml(indent=Config.XML_INDENT)
-        return rough_string
+            try:
+                rough_string = ET.tostring(root, encoding='unicode')
+                reparsed = minidom.parseString(rough_string)
+                pretty_xml_str = reparsed.toprettyxml(indent=Config.XML_INDENT)
+                lines = pretty_xml_str.split('\n')[1:]
+                return '\n'.join(lines).strip()
+            except:
+                return ET.tostring(root, encoding='unicode')
+        else:
+            return ET.tostring(root, encoding='unicode')
     except Exception as e:
-        logger.error(f"XML build error: {e}")
-        return "<Error>XML Generation Failed</Error>"
+        logger.error(f"Error building XML for row: {e}")
+        return f"<Provider><Error>Failed to build XML: {str(e)[:100]}</Error></Provider>"
 
-# --- Streamlit App ---
+def validate_and_analyze_reference_data(df: pd.DataFrame) -> Tuple[bool, List[str], Dict[str, Any]]:
+    errors = []
+    warnings = []
+    analysis = {}
+    try:
+        if len(df) == 0:
+            errors.append("Reference data is empty")
+            return False, errors, {}
+        if len(df.columns) == 0:
+            errors.append("Reference data has no columns")
+            return False, errors, {}
+        detector = ColumnDetector()
+        column_mapping, detected_types = detector.auto_detect_columns(df)
+        analysis['column_mapping'] = column_mapping
+        analysis['detected_types'] = detected_types
+        analysis['total_columns'] = len(df.columns)
+        analysis['total_rows'] = len(df)
+        if 'source' not in column_mapping:
+            warnings.append("Could not automatically identify source field column. Manual mapping may be required.")
+        if 'target' not in column_mapping:
+            warnings.append("Could not automatically identify target XML field column. Manual mapping may be required.")
+        for col in df.columns:
+            null_count = df[col].isnull().sum()
+            if null_count > len(df) * 0.5:
+                warnings.append(f"Column '{col}' has {null_count}/{len(df)} null values")
+        analysis['warnings'] = warnings
+        analysis['confidence_score'] = len(column_mapping) / 4.0
+        return True, errors, analysis
+    except Exception as e:
+        errors.append(f"Error analyzing reference data: {str(e)}")
+        return False, errors, {}
+
+def validate_provider_data(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    errors = []
+    try:
+        if len(df) == 0:
+            errors.append("Provider data is empty")
+        if len(df.columns) == 0:
+            errors.append("Provider data has no columns")
+        if len(df) > 10000:
+            errors.append("Warning: Large dataset detected. Consider processing in smaller batches.")
+    except Exception as e:
+        errors.append(f"Error validating provider data: {str(e)}")
+    return len(errors) == 0, errors
+
+def load_file_with_encoding(file, file_type: str) -> pd.DataFrame:
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+    try:
+        file.seek(0, 2)
+        file_size = file.tell()
+        file.seek(0)
+        if file_size > Config.MAX_FILE_SIZE:
+            raise ValueError(f"File too large: {file_size / (1024*1024):.1f}MB. Maximum allowed: {Config.MAX_FILE_SIZE / (1024*1024):.1f}MB")
+        for encoding in encodings:
+            try:
+                file.seek(0)
+                if file_type == "csv":
+                    df = pd.read_csv(
+                        file, 
+                        encoding=encoding, 
+                        on_bad_lines='skip',
+                        low_memory=False,
+                        dtype=str,
+                        na_values=['', 'NULL', 'null', 'NA', 'na', 'N/A', 'n/a']
+                    )
+                elif file_type in ["xlsx", "xls"]:
+                    df = pd.read_excel(file, dtype=str, na_values=['', 'NULL', 'null', 'NA', 'na', 'N/A', 'n/a'])
+                if df.empty:
+                    continue
+                return df
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                logger.error(f"Error loading file with {encoding}: {e}")
+                continue
+        raise ValueError(f"Could not read file with any supported encoding: {encodings}")
+    except Exception as e:
+        logger.error(f"File loading error: {e}")
+        raise
+
+def generate_mapping_stats(rag_df: pd.DataFrame, prov_df: pd.DataFrame, field_map: Dict[str, str]) -> Dict[str, Any]:
+    try:
+        stats = {
+            'total_reference_mappings': len(rag_df),
+            'total_provider_columns': len(prov_df.columns),
+            'mapped_columns': len(field_map),
+            'unmapped_columns': len(prov_df.columns) - len(field_map),
+            'mapping_coverage': (len(field_map) / len(prov_df.columns) * 100) if len(prov_df.columns) > 0 else 0,
+            'total_provider_records': len(prov_df),
+            'unmapped_column_list': [col for col in prov_df.columns if col not in field_map]
+        }
+        return stats
+    except Exception as e:
+        logger.error(f"Error generating stats: {e}")
+        return {
+            'total_reference_mappings': 0,
+            'total_provider_columns': 0,
+            'mapped_columns': 0,
+            'unmapped_columns': 0,
+            'mapping_coverage': 0,
+            'total_provider_records': 0,
+            'unmapped_column_list': []
+        }
+
+def create_safe_download_button(label: str, data: Any, filename: str, mime_type: str):
+    try:
+        if isinstance(data, str):
+            data_bytes = data.encode('utf-8')
+        elif hasattr(data, 'getvalue'):
+            data_bytes = data.getvalue()
+        else:
+            data_bytes = data
+        return st.download_button(
+            label=label,
+            data=data_bytes,
+            file_name=filename,
+            mime=mime_type,
+            use_container_width=True
+        )
+    except Exception as e:
+        st.error(f"Error creating download: {str(e)}")
+        return False
+
+def display_manual_mapping_interface(df: pd.DataFrame, analysis: Dict[str, Any]) -> Dict[str, str]:
+    st.markdown("### 🎯 Manual Column Mapping")
+    st.info("Auto-detection couldn't identify all columns. Please manually map the columns below:")
+    manual_mapping = {}
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Available Columns:**")
+        for i, col in enumerate(df.columns):
+            detected_type = analysis.get('detected_types', {}).get(col, 'unknown')
+            confidence = "🔍" if detected_type == 'unknown' else "✅"
+            st.write(f"• {confidence} `{col}` *(detected: {detected_type})*")
+    with col2:
+        st.markdown("**Map to Purpose:**")
+        source_col = st.selectbox(
+            "Source Fields Column (contains provider field names):",
+            ["None"] + list(df.columns),
+            index=0 if 'source' not in analysis.get('column_mapping', {}) else list(df.columns).index(analysis['column_mapping']['source']) + 1
+        )
+        target_col = st.selectbox(
+            "Target XML Fields Column (contains XML paths):",
+            ["None"] + list(df.columns),
+            index=0 if 'target' not in analysis.get('column_mapping', {}) else list(df.columns).index(analysis['column_mapping']['target']) + 1
+        )
+        type_col = st.selectbox(
+            "Mapping Type Column (optional):",
+            ["None"] + list(df.columns),
+            index=0
+        )
+        logic_col = st.selectbox(
+            "Logic/Description Column (optional):",
+            ["None"] + list(df.columns),
+            index=0
+        )
+    if source_col != "None":
+        manual_mapping['source'] = source_col
+    if target_col != "None":
+        manual_mapping['target'] = target_col
+    if type_col != "None":
+        manual_mapping['type'] = type_col
+    if logic_col != "None":
+        manual_mapping['logic'] = logic_col
+    return manual_mapping
+
+def auto_map_provider_to_reference(reference_fields: List[str], provider_columns: List[str], threshold: float = 0.6) -> Dict[str, str]:
+    mapping = {}
+    for ref_field in reference_fields:
+        best_match = None
+        best_score = 0
+        for prov_col in provider_columns:
+            score = ColumnDetector.calculate_similarity(ref_field, prov_col)
+            if score > best_score:
+                best_score = score
+                best_match = prov_col
+        if best_score >= threshold:
+            mapping[ref_field] = best_match
+        else:
+            mapping[ref_field] = None
+    return mapping
+
 def main():
-    st.set_page_config(page_title="HRP LLM Mapper", layout="wide")
-    st.markdown("""
-        <style>
-        .main-header h1 {font-size: 2.5em; margin-bottom: 0;}
-        .main-header p {font-size: 1.1em; margin-top: 0; color: grey;}
-        </style>
-        <div class="main-header">
-            <h1>🧠 Intelligent HRP AI Data Mapper</h1>
-            <p>Smart field mapping with Hugging Face LLM ✨ + Manual override + Similarity fallback</p>
+    try:
+        st.set_page_config(
+            page_title="Intelligent HRP AI Data Mapper", 
+            layout="wide",
+            initial_sidebar_state="expanded"
+        )
+        load_custom_css()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.markdown(f"""
+            <div class="main-header">
+                <h1>🧠 Intelligent HRP AI Data Mapper</h1>
+                <p>Smart field mapping with AI-powered column detection - no rigid formats required!</p>
+                <small>🗓️ Generated on {now}</small>
+            </div>
+        """, unsafe_allow_html=True)
+        st.markdown("## 🚀 Enhanced Features")
+        st.markdown("""
+        <div class="feature-grid">
+            <div class="feature-card">
+                <h4>🧠 Smart Detection</h4>
+                <p>AI automatically detects column purposes - no strict naming required</p>
+            </div>
+            <div class="feature-card">
+                <h4>🔄 Flexible Input</h4>
+                <p>Works with any column names and data structures</p>
+            </div>
+            <div class="feature-card">
+                <h4>✨ XML Generation</h4>
+                <p>HRP-compliant XML with validation and formatting</p>
+            </div>
+            <div class="feature-card">
+                <h4>📈 Analytics</h4>
+                <p>Comprehensive mapping statistics and confidence scoring</p>
+            </div>
         </div>
-    """, unsafe_allow_html=True)
-
-    api_choice = st.selectbox("🔄 Choose Target API for XML Structure:", Config.API_OPTIONS)
-    rag_file = st.file_uploader("📄 Upload Reference Mapping CSV", type="csv")
-    data_file = st.file_uploader("📁 Upload Healthcare Input Data", type=Config.SUPPORTED_FORMATS)
-
-    if not rag_file or not data_file:
-        st.info("Upload both reference and input data files to begin.")
-        return
-
-    rag_df = pd.read_csv(rag_file)
-    file_ext = data_file.name.split(".")[-1]
-    data_df = pd.read_csv(data_file) if file_ext == "csv" else pd.read_excel(data_file)
-
-    st.subheader("🔎 Mapping Setup")
-    source_col = st.selectbox("Select source field column (input field names):", rag_df.columns)
-    target_col = st.selectbox("Select target XML path column:", rag_df.columns)
-
-    preview_count = st.slider("How many records to preview?", 1, 10, Config.MAX_PREVIEW_RECORDS)
-    pretty_print = st.checkbox("Pretty print XML", True)
-    manual_mode = st.checkbox("🛠️ Enable Manual Mapping Mode", value=False)
-
-    reference_fields = rag_df[source_col].dropna().unique().tolist()
-    xml_targets = rag_df[target_col].dropna().unique().tolist()
-    field_map = {}
-    logic_map = {}
-    method_map = {}
-
-    if manual_mode:
-        st.subheader("🔧 Manual Field Mapping")
-        for ref_field in reference_fields:
-            selected = st.selectbox(f"Map '{ref_field}' to:", [""] + xml_targets, key=ref_field)
-            if selected:
-                field_map[ref_field] = selected
-                logic_map[ref_field] = "Manual override"
-                method_map[ref_field] = "Manual"
-    else:
-        with st.spinner("🔍 Mapping fields..."):
-            for ref_field in reference_fields:
-                xml_path = ""
-                logic = ""
-                method = ""
-                if Config.ENABLE_LLM_MAPPING:
-                    xml_path = llm_map_field_to_xml(ref_field, xml_targets)
-                    logic = llm_explain_mapping(ref_field, xml_path)
-                    method = "LLM"
-                if not xml_path and Config.ENABLE_SIMILARITY_FALLBACK:
-                    scores = [(t, calculate_similarity(ref_field, t)) for t in xml_targets]
-                    best_match = max(scores, key=lambda x: x[1], default=("", 0))
-                    if best_match[1] > Config.SIMILARITY_THRESHOLD:
-                        xml_path = best_match[0]
-                        logic = f"Similarity matched (score {best_match[1]:.2f})"
-                        method = "Heuristic"
-                field_map[ref_field] = xml_path
-                logic_map[ref_field] = logic
-                method_map[ref_field] = method
-
-    st.success("✅ Mapping complete. Generating XML previews...")
-
-    mapped_data = []
-    for _, row in data_df.iterrows():
-        xml_row = {}
-        for ref_field, xml_path in field_map.items():
-            if ref_field in row:
-                xml_row[xml_path] = row[ref_field]
-        mapped_data.append(xml_row)
-
-    st.subheader("📄 XML Record Preview")
-    for i in range(min(preview_count, len(mapped_data))):
-        xml_content = build_dynamic_xml(pd.Series(mapped_data[i]), pretty_print=pretty_print, root_name=api_choice)
-        st.code(xml_content, language='xml')
-
-    if st.button("📥 Download All XML"):
-        full_xml = '<?xml version="1.0"?>\n<' + api_choice + 'Records>\n' + '\n'.join(
-            build_dynamic_xml(pd.Series(row), pretty_print=pretty_print, root_name=api_choice) for row in mapped_data
-        ) + f'\n</{api_choice}Records>'
-        st.download_button("Download XML File", data=full_xml, file_name=f"{api_choice}_data.xml", mime="application/xml")
-
-    st.subheader("🧾 Field Mapping Audit")
-    audit_df = pd.DataFrame({
-        "Input Field": list(field_map.keys()),
-        "Mapped XML Field": list(field_map.values()),
-        "Logic Explanation": list(logic_map.values()),
-        "Mapping Method": list(method_map.values())
-    })
-    st.dataframe(audit_df)
-    st.download_button("📤 Download Mapping Audit", data=audit_df.to_csv(index=False), file_name="mapping_audit.csv", mime="text/csv")
+        """, unsafe_allow_html=True)
+        with st.sidebar:
+            st.header("⚙️ Configuration")
+            show_preview = st.checkbox("Show XML Preview", value=True)
+            max_preview = st.slider("Max Preview Records", 1, 10, Config.MAX_PREVIEW_RECORDS)
+            pretty_xml = st.checkbox("Pretty Print XML", value=True)
+            st.header("🎯 Detection Settings")
+            similarity_threshold = st.slider("Column Similarity Threshold", 0.1, 1.0, Config.SIMILARITY_THRESHOLD, 0.1)
+            Config.SIMILARITY_THRESHOLD = similarity_threshold
+            st.header("📊 Export Options")
+            include_stats = st.checkbox("Include Statistics in Report", value=True)
+            xml_encoding = st.selectbox("XML Encoding", ["UTF-8", "ISO-8859-1"], index=0)
+        st.markdown('<div class="step-header">📁 Step 1: Upload Reference Mapping Data</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div class="info-box">
+            <h4>🧠 Smart Upload</h4>
+            <p>Upload any CSV file with mapping data. The AI will automatically detect:</p>
+            <ul>
+                <li>Source field columns (provider field names)</li>
+                <li>Target XML path columns</li>
+                <li>Mapping type and logic columns (if present)</li>
+            </ul>
+            <p><strong>No specific column names required!</strong></p>
+        </div>
+        """, unsafe_allow_html=True)
+        rag_file = st.file_uploader(
+            "Reference Mapping File (CSV)", 
+            type=["csv"], 
+            key="rag",
+            help="Any CSV file with mapping rules - AI will auto-detect column purposes"
+        )
+        st.markdown('<div class="step-header">📄 Step 2: Upload Provider Input Data</div>', unsafe_allow_html=True)
+        st.info("Upload your provider data file in CSV or Excel format")
+        prov_file = st.file_uploader(
+            "Provider Input File", 
+            type=Config.SUPPORTED_FORMATS, 
+            key="provider",
+            help="Provider data to be transformed into HRP XML format"
+        )
+        if not rag_file or not prov_file:
+            st.markdown("""
+            <div class="warning-box">
+                <h4>⚠️ Files Required</h4>
+                <p>Please upload both reference mapping and provider data files to continue.</p>
+            </div>
+            """, unsafe_allow_html=True)
+            st.stop()
+        try:
+            with st.spinner("🔄 Loading and intelligently analyzing files..."):
+                rag_df = load_file_with_encoding(rag_file, "csv")
+                file_extension = prov_file.name.split('.')[-1].lower()
+                prov_df = load_file_with_encoding(prov_file, file_extension)
+                rag_valid, rag_errors, analysis = validate_and_analyze_reference_data(rag_df)
+                prov_valid, prov_errors = validate_provider_data(prov_df)
+                if not rag_valid or not prov_valid:
+                    error_msg = "Data validation failed:\n"
+                    error_msg += "\n".join(rag_errors + prov_errors)
+                    st.error(error_msg)
+                    st.stop()
+            st.markdown('<div class="step-header">🔍 AI Analysis Results</div>', unsafe_allow_html=True)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("📊 Columns Detected", analysis['total_columns'])
+            with col2:
+                st.metric("🎯 Auto-Mapped", len(analysis['column_mapping']))
+            with col3:
+                confidence_pct = analysis['confidence_score'] * 100
+                st.metric("🎯 Confidence", f"{confidence_pct:.0f}%")
+            if analysis['column_mapping']:
+                st.markdown("### ✅ Auto-Detected Column Mappings:")
+                for purpose, column in analysis['column_mapping'].items():
+                    purpose_emoji = {"source": "📥", "target": "📤", "type": "🔄", "logic": "📝"}
+                    st.markdown(f"""
+                    <div class="detection-result">
+                        <strong>{purpose_emoji.get(purpose, '📋')} {purpose.title()} Field:</strong> <code>{column}</code>
+                    </div>
+                    """, unsafe_allow_html=True)
+            if analysis.get('warnings'):
+                with st.expander("⚠️ Analysis Warnings", expanded=False):
+                    for warning in analysis['warnings']:
+                        st.warning(warning)
+            column_mapping = analysis['column_mapping']
+            if analysis['confidence_score'] < 0.5 or 'source' not in column_mapping or 'target' not in column_mapping:
+                manual_override = st.checkbox("🎯 Override Auto-Detection (Manual Mapping)", value=False)
+                if manual_override:
+                    column_mapping = display_manual_mapping_interface(rag_df, analysis)
+                    if not column_mapping.get('source') or not column_mapping.get('target'):
+                        st.error("Both source and target columns must be mapped. Please complete the manual mapping.")
+                        st.stop()
+            # --- Intelligent Provider-to-Reference Mapping ---
+            # Build mapping from provider columns to reference mapping source fields
+            source_col = column_mapping['source']
+            target_col = column_mapping['target']
+            reference_fields = rag_df[source_col].dropna().astype(str).unique().tolist()
+            provider_columns = prov_df.columns.astype(str).tolist()
+            provider_to_reference_map = auto_map_provider_to_reference(reference_fields, provider_columns, Config.SIMILARITY_THRESHOLD)
+            # Build field_map for XML transformation: {provider_col: xml_path}
+            field_map = {}
+            audit_rows = []
+            for _, row in rag_df.iterrows():
+                src = row[source_col]
+                tgt = row[target_col]
+                mtype = row[column_mapping.get('type')] if 'type' in column_mapping and column_mapping.get('type') in row else "Direct"
+                logic = row[column_mapping.get('logic')] if 'logic' in column_mapping and column_mapping.get('logic') in row else "No specific logic"
+                mapped_provider_col = provider_to_reference_map.get(str(src), None)
+                if mapped_provider_col:
+                    field_map[mapped_provider_col] = str(tgt)
+                    status = "✅ Mapped"
+                else:
+                    status = "⚠️ Not Found in Provider Data"
+                audit_rows.append({
+                    "Reference Field": str(src),
+                    "Provider Column": mapped_provider_col if mapped_provider_col else "",
+                    "Target XML Path": str(tgt),
+                    "Mapping Type": str(mtype),
+                    "Logic Applied": str(logic),
+                    "Status": status
+                })
+            stats = generate_mapping_stats(rag_df, prov_df, field_map)
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("📊 Total Mappings", stats['total_reference_mappings'])
+            with col2:
+                st.metric("📋 Provider Columns", stats['total_provider_columns'])
+            with col3:
+                st.metric("✅ Mapped Columns", stats['mapped_columns'])
+            with col4:
+                st.metric("📈 Coverage", f"{stats['mapping_coverage']:.1f}%")
+            if stats['unmapped_columns'] > 0:
+                with st.expander(f"⚠️ {stats['unmapped_columns']} Unmapped Columns", expanded=False):
+                    st.write("The following provider columns were not mapped:")
+                    for col in stats['unmapped_column_list']:
+                        st.write(f"• {col}")
+        except Exception as e:
+            st.markdown(f"""
+            <div class="error-box">
+                <h4>❌ File Loading Error</h4>
+                <p>Error reading files: {str(e)}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            logger.error(f"File loading error: {traceback.format_exc()}")
+            st.stop()
+        try:
+            with st.spinner("🔄 Transforming data..."):
+                mapped_data = []
+                for idx, row in prov_df.iterrows():
+                    try:
+                        xml_row = {}
+                        for prov_col, xml_path in field_map.items():
+                            if prov_col in row:
+                                xml_row[xml_path] = row[prov_col]
+                        mapped_data.append(xml_row)
+                    except Exception as e:
+                        logger.error(f"Error processing row {idx}: {e}")
+                        continue
+        except Exception as e:
+            st.error(f"Error transforming data: {str(e)}")
+            logger.error(f"Data transformation error: {traceback.format_exc()}")
+            st.stop()
+        if show_preview and mapped_data:
+            st.markdown('<div class="step-header">🔍 Step 4: XML Preview</div>', unsafe_allow_html=True)
+            try:
+                sample_df = pd.DataFrame(mapped_data)
+                preview_count = min(max_preview, len(sample_df))
+                for i in range(preview_count):
+                    xml_content = build_dynamic_xml(sample_df.iloc[i], pretty_print=pretty_xml)
+                    with st.expander(f"🏥 Provider {i+1} XML Preview", expanded=i == 0):
+                        st.markdown(f'<div class="xml-preview">{xml_content}</div>', unsafe_allow_html=True)
+            except Exception as e:
+                st.warning(f"Error generating preview: {str(e)}")
+        st.markdown('<div class="step-header">📦 Step 5: Export Results</div>', unsafe_allow_html=True)
+        try:
+            encoding_map = {"UTF-8": "utf-8", "ISO-8859-1": "iso-8859-1"}
+            selected_encoding = encoding_map[xml_encoding]
+            xml_declaration = f'<?xml version="1.0" encoding="{selected_encoding.upper()}"?>\n'
+            xml_providers = []
+            for row_data in mapped_data:
+                xml_providers.append(build_dynamic_xml(pd.Series(row_data), pretty_print=pretty_xml))
+            full_xml = xml_declaration + '<Providers>\n' + '\n'.join(xml_providers) + '\n</Providers>'
+            col1, col2 = st.columns(2)
+            with col1:
+                create_safe_download_button(
+                    "📥 Download Complete XML File",
+                    full_xml,
+                    f"hrp_providers_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml",
+                    "application/xml"
+                )
+            with col2:
+                try:
+                    audit_df = pd.DataFrame(audit_rows)
+                    if include_stats:
+                        stats_rows = []
+                        for key, value in stats.items():
+                            if key != 'unmapped_column_list':
+                                stats_rows.append({"Metric": key.replace('_', ' ').title(), "Value": str(value)})
+                        output = io.BytesIO()
+                        try:
+                            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                                audit_df.to_excel(writer, sheet_name='Mapping_Audit', index=False)
+                                pd.DataFrame(stats_rows).to_excel(writer, sheet_name='Statistics', index=False)
+                            create_safe_download_button(
+                                "📊 Download Audit Report (Excel)",
+                                output,
+                                f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                        except Exception as e:
+                            st.warning(f"Excel export failed: {str(e)}. Falling back to CSV.")
+                            csv_data = audit_df.to_csv(index=False)
+                            create_safe_download_button(
+                                "📊 Download Audit Report (CSV)",
+                                csv_data,
+                                f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                "text/csv"
+                            )
+                    else:
+                        csv_data = audit_df.to_csv(index=False)
+                        create_safe_download_button(
+                            "📊 Download Audit Report (CSV)",
+                            csv_data,
+                            f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            "text/csv"
+                        )
+                except Exception as e:
+                    st.error(f"Error creating audit report: {str(e)}")
+        except Exception as e:
+            st.error(f"Error generating exports: {str(e)}")
+            logger.error(f"Export generation error: {traceback.format_exc()}")
+        try:
+            st.markdown('<div class="step-header">📋 Mapping Audit Report</div>', unsafe_allow_html=True)
+            if audit_rows:
+                audit_df = pd.DataFrame(audit_rows)
+                col1, col2 = st.columns(2)
+                with col1:
+                    status_filter = st.selectbox(
+                        "Filter by Status:",
+                        ["All", "✅ Mapped", "⚠️ Not Found in Provider Data"],
+                        index=0
+                    )
+                with col2:
+                    mapping_types = list(audit_df["Mapping Type"].unique()) if not audit_df.empty else []
+                    mapping_type_filter = st.selectbox(
+                        "Filter by Mapping Type:",
+                        ["All"] + mapping_types,
+                        index=0
+                    )
+                display_df = audit_df.copy()
+                if status_filter != "All":
+                    display_df = display_df[display_df["Status"] == status_filter]
+                if mapping_type_filter != "All":
+                    display_df = display_df[display_df["Mapping Type"] == mapping_type_filter]
+                st.dataframe(display_df, use_container_width=True)
+            else:
+                st.warning("No audit data available.")
+            st.markdown(f"""
+            <div class="stats-container">
+                <h4>📊 Processing Summary</h4>
+                <p><strong>{len(prov_df)}</strong> provider records processed | 
+                <strong>{stats['mapped_columns']}</strong> fields mapped | 
+                <strong>{stats['mapping_coverage']:.1f}%</strong> coverage achieved</p>
+            </div>
+            """, unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Error displaying audit report: {str(e)}")
+            logger.error(f"Audit report display error: {traceback.format_exc()}")
+    except Exception as e:
+        st.error(f"Critical application error: {str(e)}")
+        logger.error(f"Critical error: {traceback.format_exc()}")
+        st.markdown("""
+        <div class="error-box">
+            <h4>❌ Application Error</h4>
+            <p>A critical error occurred. Please check your input files and try again.</p>
+        </div>
+        """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
