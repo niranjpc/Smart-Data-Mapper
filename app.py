@@ -11,151 +11,82 @@ import re
 import traceback
 from difflib import SequenceMatcher
 
-# --- Enhanced Logging ---
+# --- Logging ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- Configuration ---
+# --- Config ---
 class Config:
     MAX_PREVIEW_RECORDS = 5
     XML_INDENT = "  "
     SUPPORTED_FORMATS = ["csv", "xlsx", "xls"]
     DEFAULT_ENCODING = "utf-8"
-    MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB limit
-    SIMILARITY_THRESHOLD = 0.6  # Minimum similarity for auto-mapping
+    MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+    SIMILARITY_THRESHOLD = 0.6
 
-# --- API Schema Definitions (Simulated) ---
+# --- API Schemas (Simulated) ---
 API_SCHEMAS = {
     "FacilityLoad": {
         "root": "FacilityLoad",
         "fields": [
-            ("FacilityID", "12345"),
-            ("FacilityName", "Sample Hospital"),
-            ("Address", "123 Main St"),
-            ("City", "Metropolis"),
-            ("State", "NY"),
-            ("Zip", "10001")
+            "FacilityID", "FacilityName", "Address", "City", "State", "Zip"
         ]
     },
     "PractitionerLoad": {
         "root": "PractitionerLoad",
         "fields": [
-            ("PractitionerID", "P98765"),
-            ("FirstName", "John"),
-            ("LastName", "Doe"),
-            ("Specialty", "Cardiology"),
-            ("NPI", "1234567890")
+            "PractitionerID", "FirstName", "LastName", "Specialty", "NPI"
         ]
     },
     "MemberLoad": {
         "root": "MemberLoad",
         "fields": [
-            ("MemberID", "M54321"),
-            ("FirstName", "Jane"),
-            ("LastName", "Smith"),
-            ("DOB", "1980-01-01"),
-            ("Plan", "Gold")
+            "MemberID", "FirstName", "LastName", "DOB", "Plan"
         ]
     }
 }
 
-def generate_api_xml(api_name: str, schema: dict) -> str:
+def generate_api_xml(api_name: str, data: Dict[str, Any], pretty: bool = True) -> str:
+    schema = API_SCHEMAS[api_name]
     root = ET.Element(schema["root"])
-    for field, value in schema["fields"]:
-        ET.SubElement(root, field).text = value
+    for field in schema["fields"]:
+        ET.SubElement(root, field).text = str(data.get(field, ""))
     rough_string = ET.tostring(root, encoding='unicode')
-    reparsed = minidom.parseString(rough_string)
-    pretty_xml_str = reparsed.toprettyxml(indent=Config.XML_INDENT)
-    lines = pretty_xml_str.split('\n')[1:]
-    return '\n'.join(lines).strip()
+    if pretty:
+        reparsed = minidom.parseString(rough_string)
+        pretty_xml_str = reparsed.toprettyxml(indent=Config.XML_INDENT)
+        lines = pretty_xml_str.split('\n')[1:]
+        return '\n'.join(lines).strip()
+    else:
+        return rough_string
 
 # --- Intelligent Column Detection ---
 class ColumnDetector:
-    SOURCE_PATTERNS = [
-        r'\b(field|column|source|input|provider|data)[\s_-]*(name|field|col)?\b',
-        r'\b(original|raw|src)[\s_-]*(field|column)?\b',
-        r'\bfrom[\s_-]*(field|column)?\b'
-    ]
-    TARGET_PATTERNS = [
-        r'\b(xml|target|destination|output|hrp)[\s_-]*(field|path|element)?\b',
-        r'\b(mapped|transformed|converted)[\s_-]*(to|field)?\b',
-        r'\bto[\s_-]*(field|column|xml)?\b'
-    ]
-    TYPE_PATTERNS = [
-        r'\b(type|kind|method|mapping[\s_-]*type)\b',
-        r'\b(transform|conversion|logic)[\s_-]*(type|method)?\b'
-    ]
-    LOGIC_PATTERNS = [
-        r'\b(logic|rule|description|note|comment)\b',
-        r'\b(applied|transformation|instruction)\b',
-        r'\b(how|what|why|when)[\s_-]*(to|apply)?\b'
-    ]
     @staticmethod
     def calculate_similarity(text1: str, text2: str) -> float:
         return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
     @classmethod
-    def detect_column_type(cls, column_name: str, sample_values: List[str]) -> str:
-        col_lower = column_name.lower().strip()
-        for pattern in cls.SOURCE_PATTERNS:
-            if re.search(pattern, col_lower, re.IGNORECASE):
-                return 'source'
-        for pattern in cls.TARGET_PATTERNS:
-            if re.search(pattern, col_lower, re.IGNORECASE):
-                return 'target'
-        for pattern in cls.TYPE_PATTERNS:
-            if re.search(pattern, col_lower, re.IGNORECASE):
-                return 'type'
-        for pattern in cls.LOGIC_PATTERNS:
-            if re.search(pattern, col_lower, re.IGNORECASE):
-                return 'logic'
-        if sample_values:
-            xml_path_count = sum(1 for val in sample_values[:10] if isinstance(val, str) and ('/' in val or '<' in val))
-            if xml_path_count > len(sample_values) * 0.3:
-                return 'target'
-        return 'unknown'
-    @classmethod
-    def auto_detect_columns(cls, df: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, str]]:
-        column_mapping = {}
-        detected_types = {}
-        for col in df.columns:
-            sample_values = df[col].dropna().astype(str).tolist()[:20]
-            col_type = cls.detect_column_type(col, sample_values)
-            detected_types[col] = col_type
-        source_candidates = [col for col, typ in detected_types.items() if typ == 'source']
-        target_candidates = [col for col, typ in detected_types.items() if typ == 'target']
-        type_candidates = [col for col, typ in detected_types.items() if typ == 'type']
-        logic_candidates = [col for col, typ in detected_types.items() if typ == 'logic']
-        if not source_candidates:
-            source_candidates = cls._find_similar_columns(df.columns, ['fields', 'field', 'source', 'column', 'provider', 'input'])
-        if not target_candidates:
-            target_candidates = cls._find_similar_columns(df.columns, ['xml', 'target', 'output', 'destination', 'hrp', 'mapped'])
-        if not type_candidates:
-            type_candidates = cls._find_similar_columns(df.columns, ['type', 'mapping_type', 'method', 'transform'])
-        if not logic_candidates:
-            logic_candidates = cls._find_similar_columns(df.columns, ['logic', 'rule', 'description', 'note', 'applied'])
-        if source_candidates:
-            column_mapping['source'] = source_candidates[0]
-        if target_candidates:
-            column_mapping['target'] = target_candidates[0]
-        if type_candidates:
-            column_mapping['type'] = type_candidates[0]
-        if logic_candidates:
-            column_mapping['logic'] = logic_candidates[0]
-        return column_mapping, detected_types
-    @classmethod
-    def _find_similar_columns(cls, columns: List[str], reference_terms: List[str]) -> List[str]:
-        matches = []
-        for col in columns:
-            col_lower = col.lower().strip()
-            for term in reference_terms:
-                if cls.calculate_similarity(col_lower, term) >= Config.SIMILARITY_THRESHOLD:
-                    matches.append((col, cls.calculate_similarity(col_lower, term)))
-                    break
-        matches.sort(key=lambda x: x[1], reverse=True)
-        return [match[0] for match in matches]
+    def auto_map_fields(cls, api_fields: List[str], provider_columns: List[str]) -> Tuple[Dict[str, str], Dict[str, float]]:
+        mapping = {}
+        confidence = {}
+        for api_field in api_fields:
+            best_match = None
+            best_score = 0
+            for prov_col in provider_columns:
+                score = cls.calculate_similarity(api_field, prov_col)
+                if score > best_score:
+                    best_score = score
+                    best_match = prov_col
+            if best_score >= Config.SIMILARITY_THRESHOLD:
+                mapping[api_field] = best_match
+                confidence[api_field] = best_score
+            else:
+                mapping[api_field] = None
+                confidence[api_field] = best_score
+        return mapping, confidence
 
 def load_custom_css():
     try:
@@ -181,10 +112,60 @@ def load_custom_css():
         logger.error(f"Error loading CSS: {e}")
         st.error("CSS loading failed, but the app will continue to work.")
 
-# (Paste all your helper functions here: build_dynamic_xml, validate_and_analyze_reference_data, validate_provider_data, load_file_with_encoding, generate_mapping_stats, create_safe_download_button, display_manual_mapping_interface, auto_map_provider_to_reference)
-# (For brevity, these are the same as in your previous code and can be pasted here.)
+def create_safe_download_button(label: str, data: Any, filename: str, mime_type: str):
+    try:
+        if isinstance(data, str):
+            data_bytes = data.encode('utf-8')
+        elif hasattr(data, 'getvalue'):
+            data_bytes = data.getvalue()
+        else:
+            data_bytes = data
+        return st.download_button(
+            label=label,
+            data=data_bytes,
+            file_name=filename,
+            mime=mime_type,
+            use_container_width=True
+        )
+    except Exception as e:
+        st.error(f"Error creating download: {str(e)}")
+        return False
 
-# --- Main Application ---
+def load_file_with_encoding(file, file_type: str) -> pd.DataFrame:
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+    try:
+        file.seek(0, 2)
+        file_size = file.tell()
+        file.seek(0)
+        if file_size > Config.MAX_FILE_SIZE:
+            raise ValueError(f"File too large: {file_size / (1024*1024):.1f}MB. Maximum allowed: {Config.MAX_FILE_SIZE / (1024*1024):.1f}MB")
+        for encoding in encodings:
+            try:
+                file.seek(0)
+                if file_type == "csv":
+                    df = pd.read_csv(
+                        file, 
+                        encoding=encoding, 
+                        on_bad_lines='skip',
+                        low_memory=False,
+                        dtype=str,
+                        na_values=['', 'NULL', 'null', 'NA', 'na', 'N/A', 'n/a']
+                    )
+                elif file_type in ["xlsx", "xls"]:
+                    df = pd.read_excel(file, dtype=str, na_values=['', 'NULL', 'null', 'NA', 'na', 'N/A', 'n/a'])
+                if df.empty:
+                    continue
+                return df
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                logger.error(f"Error loading file with {encoding}: {e}")
+                continue
+        raise ValueError(f"Could not read file with any supported encoding: {encodings}")
+    except Exception as e:
+        logger.error(f"File loading error: {e}")
+        raise
+
 def main():
     try:
         st.set_page_config(
@@ -224,32 +205,108 @@ def main():
         """, unsafe_allow_html=True)
 
         with st.sidebar:
+            st.header("🛠️ API XML Generator")
+            api_name = st.selectbox("Select API to Generate XML", list(API_SCHEMAS.keys()))
             st.header("⚙️ Configuration")
             show_preview = st.checkbox("Show XML Preview", value=True)
             max_preview = st.slider("Max Preview Records", 1, 10, Config.MAX_PREVIEW_RECORDS)
             pretty_xml = st.checkbox("Pretty Print XML", value=True)
-            st.header("🎯 Detection Settings")
-            similarity_threshold = st.slider("Column Similarity Threshold", 0.1, 1.0, Config.SIMILARITY_THRESHOLD, 0.1)
-            Config.SIMILARITY_THRESHOLD = similarity_threshold
             st.header("📊 Export Options")
-            include_stats = st.checkbox("Include Statistics in Report", value=True)
             xml_encoding = st.selectbox("XML Encoding", ["UTF-8", "ISO-8859-1"], index=0)
-            st.header("🛠️ API XML Generator")
-            api_name = st.selectbox("Select API to Generate XML", list(API_SCHEMAS.keys()))
-            if st.button("Generate API XML"):
-                schema = API_SCHEMAS[api_name]
-                xml_content = generate_api_xml(api_name, schema)
-                st.markdown(f"#### XML for `{api_name}`")
-                st.markdown(f'<div class="xml-preview">{xml_content}</div>', unsafe_allow_html=True)
-                create_safe_download_button(
-                    f"📥 Download {api_name} XML",
-                    xml_content,
-                    f"{api_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml",
-                    "application/xml"
-                )
 
-        # ... (rest of your existing main logic for mapping, preview, export, etc.) ...
-        # (Paste your mapping, preview, export, and audit report code here, unchanged.)
+        st.markdown('<div class="step-header">📁 Step 1: Upload Reference Mapping Data (RAG)</div>', unsafe_allow_html=True)
+        rag_file = st.file_uploader(
+            "Reference Mapping File (CSV)", 
+            type=["csv"], 
+            key="rag",
+            help="Any CSV file with mapping rules"
+        )
+        st.markdown('<div class="step-header">📄 Step 2: Upload Provider Input Data</div>', unsafe_allow_html=True)
+        prov_file = st.file_uploader(
+            "Provider Input File", 
+            type=Config.SUPPORTED_FORMATS, 
+            key="provider",
+            help="Provider data to be transformed"
+        )
+        if not rag_file or not prov_file:
+            st.markdown("""
+            <div class="warning-box">
+                <h4>⚠️ Files Required</h4>
+                <p>Please upload both reference mapping and provider data files to continue.</p>
+            </div>
+            """, unsafe_allow_html=True)
+            st.stop()
+
+        # Load files
+        with st.spinner("🔄 Loading files..."):
+            rag_df = load_file_with_encoding(rag_file, "csv")
+            file_extension = prov_file.name.split('.')[-1].lower()
+            prov_df = load_file_with_encoding(prov_file, file_extension)
+
+        # --- Intelligent Mapping to API ---
+        api_fields = API_SCHEMAS[api_name]["fields"]
+        provider_columns = prov_df.columns.astype(str).tolist()
+        field_map, confidence_map = ColumnDetector.auto_map_fields(api_fields, provider_columns)
+
+        # --- Audit Table ---
+        audit_rows = []
+        for api_field in api_fields:
+            mapped_col = field_map[api_field]
+            conf = confidence_map[api_field]
+            logic = f"Similarity: {conf:.2f}"
+            status = "✅" if mapped_col else "❌"
+            audit_rows.append({
+                "API Field": api_field,
+                "Provider Column": mapped_col if mapped_col else "",
+                "Confidence": f"{conf:.2f}",
+                "Logic Applied": logic,
+                "Status": status
+            })
+
+        st.markdown('<div class="step-header">🧠 Step 3: Mapping Audit</div>', unsafe_allow_html=True)
+        audit_df = pd.DataFrame(audit_rows)
+        st.dataframe(audit_df, use_container_width=True)
+        avg_conf = np.mean([v for v in confidence_map.values() if v is not None])
+        st.info(f"Average mapping confidence: {avg_conf:.2f}")
+
+        # --- XML Generation ---
+        st.markdown('<div class="step-header">📦 Step 4: Generate & Download API XML</div>', unsafe_allow_html=True)
+        mapped_data = []
+        for idx, row in prov_df.iterrows():
+            api_row = {}
+            for api_field in api_fields:
+                prov_col = field_map[api_field]
+                api_row[api_field] = row[prov_col] if prov_col and prov_col in row else ""
+            mapped_data.append(api_row)
+
+        if show_preview and mapped_data:
+            preview_count = min(max_preview, len(mapped_data))
+            for i in range(preview_count):
+                xml_content = generate_api_xml(api_name, mapped_data[i], pretty=pretty_xml)
+                with st.expander(f"XML Preview for Record {i+1}", expanded=(i==0)):
+                    st.markdown(f'<div class="xml-preview">{xml_content}</div>', unsafe_allow_html=True)
+
+        # Download full XML
+        xml_declaration = f'<?xml version="1.0" encoding="{xml_encoding.upper()}"?>\n'
+        xml_payloads = [generate_api_xml(api_name, row, pretty=pretty_xml) for row in mapped_data]
+        full_xml = xml_declaration + f'<{API_SCHEMAS[api_name]["root"]}s>\n' + '\n'.join(xml_payloads) + f'\n</{API_SCHEMAS[api_name]["root"]}s>'
+        create_safe_download_button(
+            f"📥 Download {api_name} XML Payload",
+            full_xml,
+            f"{api_name}_payload_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml",
+            "application/xml"
+        )
+
+        # Download audit
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            audit_df.to_excel(writer, sheet_name='Mapping_Audit', index=False)
+        create_safe_download_button(
+            "📊 Download Audit Report (Excel)",
+            output,
+            f"{api_name}_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     except Exception as e:
         st.error(f"Critical application error: {str(e)}")
