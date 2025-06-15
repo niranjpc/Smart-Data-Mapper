@@ -96,7 +96,7 @@ API_SCHEMAS = {
 def get_hf_token():
     return st.secrets.get("HF_TOKEN") or os.getenv("HF_TOKEN")
 
-def hf_inference(prompt, model="mistralai/Mixtral-8x7B-Instruct-v0.1", max_new_tokens=1024, temperature=0.1):
+def hf_inference(prompt, model="mistralai/Mixtral-8x7B-Instruct-v0.1", max_new_tokens=2048, temperature=0.1):
     HF_TOKEN = get_hf_token()
     if not HF_TOKEN:
         st.error("Hugging Face API key not found. Please set HF_TOKEN in Streamlit secrets or environment.")
@@ -182,15 +182,15 @@ data_df = pd.read_csv(data_file) if data_file.name.endswith(".csv") else pd.read
 
 # --- LLM+RAG Mapping ---
 st.markdown('<div class="step-header">🔍 Step 3: AI Mapping (LLM + RAG)</div>', unsafe_allow_html=True)
-with st.spinner("Using LLM to map your healthcare data columns to XML fields..."):
-    # Prepare prompt
-    reference_examples = rag_df.head(20).to_dict(orient="records")
-    data_columns = list(data_df.columns)
-    xml_fields = [f[0] for f in api_schema["fields"]]
-    prompt = f"""
-You are a data mapping expert. Given the following reference mapping table (as examples), a list of healthcare data columns, and a list of target XML fields for the {api_choice} API, map each XML field to the most appropriate healthcare data column. If no good match exists, return null. Also, for each mapping, provide a short explanation of the logic (direct, calculated, rule-based, LLM fallback, etc).
 
-Reference mapping examples (first 20 rows):
+def get_llm_mapping(rag_df, data_df, api_schema, api_choice, max_fields=15, max_examples=10):
+    xml_fields = [f[0] for f in api_schema["fields"]][:max_fields]
+    reference_examples = rag_df.head(max_examples).to_dict(orient="records")
+    data_columns = list(data_df.columns)
+    prompt = f"""
+You are a data mapping expert. Given the following reference mapping table (as examples), a list of healthcare data columns, and a list of target XML fields for the {api_choice} API, map each XML field to the most appropriate healthcare data column. If no good match exists, return null. For each mapping, provide a short explanation of the logic (direct, calculated, rule-based, LLM fallback, etc).
+
+Reference mapping examples (first {max_examples} rows):
 {reference_examples}
 
 Healthcare data columns:
@@ -199,29 +199,41 @@ Healthcare data columns:
 Target XML fields:
 {xml_fields}
 
-Return a JSON object like:
+Return your answer as a valid JSON object, and nothing else, like this:
 {{
-  "XMLField1": {{"input_field": "healthcare_data_column", "logic": "Direct/Calculated/Rule-based/LLM fallback/..." }},
+  "XMLField1": {{"input_field": "healthcare_data_column", "logic": "Direct"}},
+  "XMLField2": {{"input_field": null, "logic": "No good match found"}},
   ...
 }}
 If you can't find a good match, use null for input_field and explain in logic.
 """
     llm_output = hf_inference(prompt)
-    # Try to extract JSON from the output
-    try:
-        mapping = json.loads(llm_output[llm_output.find("{"):llm_output.rfind("}")+1])
-    except Exception:
-        st.error("Could not parse mapping from LLM output. Raw output below:")
-        st.code(llm_output)
-        st.stop()
+    return llm_output
+
+if "llm_output" not in st.session_state or st.button("Retry Mapping"):
+    with st.spinner("Using LLM to map your healthcare data columns to XML fields..."):
+        llm_output = get_llm_mapping(rag_df, data_df, api_schema, api_choice)
+        st.session_state["llm_output"] = llm_output
+else:
+    llm_output = st.session_state["llm_output"]
+
+st.markdown("#### LLM Output (for debugging)")
+st.code(llm_output, language="json")
+
+# Try to extract JSON from the output
+try:
+    mapping = json.loads(llm_output[llm_output.find("{"):llm_output.rfind("}")+1])
+except Exception:
+    st.error("Could not parse mapping from LLM output. Please review the output above, reduce the number of fields/examples, and click 'Retry Mapping'.")
+    st.stop()
 
 # --- Review Mapping Screen ---
 st.markdown('<div class="step-header">🧐 Step 4: Review & Edit Mapping</div>', unsafe_allow_html=True)
 mapping_table = []
 for xml_field, desc in api_schema["fields"]:
     map_info = mapping.get(xml_field, {})
-    input_field = map_info.get("input_field")
-    logic = map_info.get("logic", "")
+    input_field = map_info.get("input_field") if isinstance(map_info, dict) else None
+    logic = map_info.get("logic", "") if isinstance(map_info, dict) else ""
     status = "✅" if input_field else "❌"
     mapping_table.append({
         "XML Field": xml_field,
