@@ -373,7 +373,7 @@ def auto_map_healthcare_to_reference(reference_fields: List[str], data_columns: 
         else:
             mapping[ref_field] = None
     return mapping
-# --- Main Application ---
+    # --- Main Application ---
 def main():
     st.set_page_config(
         page_title="Intelligent HRP AI Data Mapper", 
@@ -580,53 +580,45 @@ def main():
                     st.markdown(f'<div class="xml-preview">{xml_content}</div>', unsafe_allow_html=True)
         except Exception as e:
             st.warning(f"Error generating preview: {str(e)}")
-                # Generate full XML
-    st.markdown('<div class="step-header">📦 Step 5: Export Results</div>', unsafe_allow_html=True)
-    try:
-        encoding_map = {"UTF-8": "utf-8", "ISO-8859-1": "iso-8859-1"}
-        selected_encoding = encoding_map[xml_encoding]
-        xml_declaration = f'<?xml version="1.0" encoding="{selected_encoding.upper()}"?>\n'
-        xml_records = []
-        for row_data in mapped_data:
-            xml_records.append(build_dynamic_xml(pd.Series(row_data), pretty_print=pretty_xml))
-        full_xml = xml_declaration + '<HealthcareDataRecords>\n' + '\n'.join(xml_records) + '\n</HealthcareDataRecords>'
-        col1, col2 = st.columns(2)
-        with col1:
-            create_safe_download_button(
-                "📥 Download Complete XML File",
-                full_xml,
-                f"hrp_healthcare_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml",
-                "application/xml"
-            )
-        with col2:
-            try:
-                audit_df = pd.DataFrame(audit_rows)
-                if include_stats:
-                    stats_rows = []
-                    for key, value in stats.items():
-                        if key != 'unmapped_column_list':
-                            stats_rows.append({"Metric": key.replace('_', ' ').title(), "Value": str(value)})
-                    output = io.BytesIO()
-                    try:
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            audit_df.to_excel(writer, sheet_name='Mapping_Audit', index=False)
-                            pd.DataFrame(stats_rows).to_excel(writer, sheet_name='Statistics', index=False)
-                        create_safe_download_button(
-                            "📊 Download Audit Report (Excel)",
-                            output,
-                            f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                    except Exception as e:
-                        st.warning(f"Excel export failed: {str(e)}. Falling back to CSV.")
-                        csv_data = audit_df.to_csv(index=False)
-                        create_safe_download_button(
-                            "📊 Download Audit Report (CSV)",
-                            csv_data,
-                            f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            "text/csv"
-                        )
-                else:
+            # Generate full XML
+st.markdown('<div class="step-header">📦 Step 5: Export Results</div>', unsafe_allow_html=True)
+try:
+    encoding_map = {"UTF-8": "utf-8", "ISO-8859-1": "iso-8859-1"}
+    selected_encoding = encoding_map[xml_encoding]
+    xml_declaration = f'<?xml version="1.0" encoding="{selected_encoding.upper()}"?>\n'
+    xml_records = []
+    for row_data in mapped_data:
+        xml_records.append(build_dynamic_xml(pd.Series(row_data), pretty_print=pretty_xml))
+    full_xml = xml_declaration + '<HealthcareDataRecords>\n' + '\n'.join(xml_records) + '\n</HealthcareDataRecords>'
+    col1, col2 = st.columns(2)
+    with col1:
+        create_safe_download_button(
+            "📥 Download Complete XML File",
+            full_xml,
+            f"hrp_healthcare_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml",
+            "application/xml"
+        )
+    with col2:
+        try:
+            audit_df = pd.DataFrame(audit_rows)
+            if include_stats:
+                stats_rows = []
+                for key, value in stats.items():
+                    if key != 'unmapped_column_list':
+                        stats_rows.append({"Metric": key.replace('_', ' ').title(), "Value": str(value)})
+                output = io.BytesIO()
+                try:
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        audit_df.to_excel(writer, sheet_name='Mapping_Audit', index=False)
+                        pd.DataFrame(stats_rows).to_excel(writer, sheet_name='Statistics', index=False)
+                    create_safe_download_button(
+                        "📊 Download Audit Report (Excel)",
+                        output,
+                        f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                except Exception as e:
+                    st.warning(f"Excel export failed: {str(e)}. Falling back to CSV.")
                     csv_data = audit_df.to_csv(index=False)
                     create_safe_download_button(
                         "📊 Download Audit Report (CSV)",
@@ -634,8 +626,18 @@ def main():
                         f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         "text/csv"
                     )
-            except Exception as e:
-                st.error(f"Error creating audit report: {str(e)}")
+            else:
+                csv_data = audit_df.to_csv(index=False)
+                create_safe_download_button(
+                    "📊 Download Audit Report (CSV)",
+                    csv_data,
+                    f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    "text/csv"
+                )
+        except Exception as e:
+            st.error(f"Error creating audit report: {str(e)}")
+except Exception as e:
+    st.error(f"Error generating XML or audit report: {str(e)}")
 
 if __name__ == "__main__":
     main()
