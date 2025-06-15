@@ -38,7 +38,14 @@ API_SCHEMAS = {
     "PractitionerLoad": {
         "root": "PractitionerLoad",
         "fields": [
-            "PractitionerID", "FirstName", "LastName", "Specialty", "NPI"
+            # 50 fields, a mix of direct, derived, and logical mappings
+            "NPI", "FirstName", "LastName", "MiddleInitial", "Suffix", "Gender", "DOB", "Degree", "LicenseNumber", "LicenseState",
+            "LicenseExpiration", "DEA", "DEAExpiration", "PrimarySpecialty", "SecondarySpecialty", "BoardCertified", "BoardEligible",
+            "CAQHID", "CredentialingStatus", "CredentialingDate", "RecredentialingDue", "MedicareEnrolled", "MedicaidEnrolled",
+            "PTAN", "MedicaidProviderID", "PECOSDate", "OptOutDate", "AcceptingNewPatients", "TelemedicineEnabled",
+            "OfficeHours", "AgeRange", "Address1", "Address2", "City", "State", "Zip", "County", "Phone", "Fax", "Email",
+            "Website", "ContractStatus", "ContractEffective", "ContractTermination", "ParticipatingStatus", "CapitationRate",
+            "FeeSchedule", "CopayAmount", "DeductibleAmount", "ReimbursementRate", "RiskAdjustmentFactor"
         ]
     },
     "MemberLoad": {
@@ -48,6 +55,78 @@ API_SCHEMAS = {
         ]
     }
 }
+
+# --- Field Derivation Logic for PractitionerLoad ---
+def derive_practitioner_fields(row: pd.Series) -> Dict[str, Any]:
+    # This is a demonstration. In real use, expand logic as needed.
+    def safe(val, default=""):
+        return str(val) if pd.notna(val) else default
+
+    # Example of derived/complex logic:
+    office_hours = "; ".join([
+        f"Mon:{safe(row.get('office_hours_monday'))}",
+        f"Tue:{safe(row.get('office_hours_tuesday'))}",
+        f"Wed:{safe(row.get('office_hours_wednesday'))}",
+        f"Thu:{safe(row.get('office_hours_thursday'))}",
+        f"Fri:{safe(row.get('office_hours_friday'))}",
+        f"Sat:{safe(row.get('office_hours_saturday'))}",
+        f"Sun:{safe(row.get('office_hours_sunday'))}"
+    ])
+    age_range = f"{safe(row.get('age_range_min'))}-{safe(row.get('age_range_max'))}"
+
+    return {
+        "NPI": safe(row.get("npi")),
+        "FirstName": safe(row.get("first_name")),
+        "LastName": safe(row.get("last_name")),
+        "MiddleInitial": safe(row.get("middle_initial")),
+        "Suffix": safe(row.get("suffix")),
+        "Gender": safe(row.get("gender")),
+        "DOB": safe(row.get("date_of_birth")),
+        "Degree": safe(row.get("degree")),
+        "LicenseNumber": safe(row.get("license_number")),
+        "LicenseState": safe(row.get("license_state")),
+        "LicenseExpiration": safe(row.get("license_expiration")),
+        "DEA": safe(row.get("dea_number")),
+        "DEAExpiration": safe(row.get("dea_expiration")),
+        "PrimarySpecialty": safe(row.get("primary_specialty")),
+        "SecondarySpecialty": safe(row.get("secondary_specialty")),
+        "BoardCertified": safe(row.get("board_certified")),
+        "BoardEligible": safe(row.get("board_eligible")),
+        "CAQHID": safe(row.get("caqh_id")),
+        "CredentialingStatus": safe(row.get("credentialing_status")),
+        "CredentialingDate": safe(row.get("credentialing_date")),
+        "RecredentialingDue": safe(row.get("recredentialing_due")),
+        "MedicareEnrolled": safe(row.get("medicare_enrolled")),
+        "MedicaidEnrolled": safe(row.get("medicaid_enrolled")),
+        "PTAN": safe(row.get("ptan_number")),
+        "MedicaidProviderID": safe(row.get("medicaid_provider_id")),
+        "PECOSDate": safe(row.get("pecos_enrollment_date")),
+        "OptOutDate": safe(row.get("opt_out_date")),
+        "AcceptingNewPatients": safe(row.get("accepting_new_patients")),
+        "TelemedicineEnabled": safe(row.get("telemedicine_enabled")),
+        "OfficeHours": office_hours,
+        "AgeRange": age_range,
+        "Address1": safe(row.get("address_line_1")),
+        "Address2": safe(row.get("address_line_2")),
+        "City": safe(row.get("city")),
+        "State": safe(row.get("state")),
+        "Zip": safe(row.get("zip_code")),
+        "County": safe(row.get("county")),
+        "Phone": safe(row.get("phone_number")),
+        "Fax": safe(row.get("fax_number")),
+        "Email": safe(row.get("email")),
+        "Website": safe(row.get("website")),
+        "ContractStatus": safe(row.get("contract_status")),
+        "ContractEffective": safe(row.get("contract_effective_date")),
+        "ContractTermination": safe(row.get("contract_termination_date")),
+        "ParticipatingStatus": safe(row.get("participating_status")),
+        "CapitationRate": safe(row.get("capitation_rate")),
+        "FeeSchedule": safe(row.get("fee_schedule")),
+        "CopayAmount": safe(row.get("copay_amount")),
+        "DeductibleAmount": safe(row.get("deductible_amount")),
+        "ReimbursementRate": safe(row.get("reimbursement_rate")),
+        "RiskAdjustmentFactor": safe(row.get("risk_adjustment_factor")),
+    }
 
 def generate_api_xml(api_name: str, data: Dict[str, Any], pretty: bool = True) -> str:
     schema = API_SCHEMAS[api_name]
@@ -63,7 +142,6 @@ def generate_api_xml(api_name: str, data: Dict[str, Any], pretty: bool = True) -
     else:
         return rough_string
 
-# --- Intelligent Column Detection ---
 class ColumnDetector:
     @staticmethod
     def calculate_similarity(text1: str, text2: str) -> float:
@@ -93,8 +171,8 @@ def load_custom_css():
         st.markdown("""
         <style>
         .main-header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 2rem; border-radius: 15px; margin-bottom: 2rem; text-align: center; color: white; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
-        .main-header h1 { font-size: 2.8rem; font-weight: 700; margin-bottom: 0.5rem; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
-        .main-header p { font-size: 1.2rem; margin: 0.5rem 0; opacity: 0.95; }
+        .main-header h1 { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.5rem; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
+        .main-header p { font-size: 1.1rem; margin: 0.5rem 0; opacity: 0.95; }
         .main-header small { font-size: 0.9rem; display: block; margin-top: 1rem; color: #e8e8e8; opacity: 0.8; }
         .xml-preview { background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); border: 2px solid #dee2e6; border-radius: 10px; padding: 1.5rem; margin: 1rem 0; font-family: 'Courier New', monospace; font-size: 0.9rem; white-space: pre-wrap; overflow-x: auto; box-shadow: inset 0 1px 3px rgba(0,0,0,0.1); max-height: 400px; overflow-y: auto; }
         .stats-container { background: linear-gradient(135deg, #28a745 0%, #20c997 100%); color: white; padding: 1rem; border-radius: 10px; margin: 1rem 0; text-align: center; }
@@ -102,8 +180,8 @@ def load_custom_css():
         .success-box { background: linear-gradient(135deg, #28a745 0%, #20c997 100%); color: white; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
         .error-box { background: linear-gradient(135deg, #dc3545 0%, #c82333 100%); color: white; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
         .info-box { background: linear-gradient(135deg, #17a2b8 0%, #138496 100%); color: white; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
-        .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; margin: 1rem 0; }
-        .feature-card { background: white; border: 1px solid #dee2e6; border-radius: 10px; padding: 1rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .feature-list { margin: 1rem 0 1.5rem 0; padding-left: 1.2rem; font-size: 1rem; }
+        .feature-list li { margin-bottom: 0.3rem; }
         .step-header { background: linear-gradient(135deg, #6c757d 0%, #495057 100%); color: white; padding: 0.8rem 1.2rem; border-radius: 8px; margin: 1.5rem 0 1rem 0; font-weight: 600; }
         .detection-result { background: #f8f9fa; border-left: 4px solid #007bff; padding: 1rem; margin: 0.5rem 0; border-radius: 0 8px 8px 0; }
         </style>
@@ -131,45 +209,10 @@ def create_safe_download_button(label: str, data: Any, filename: str, mime_type:
         st.error(f"Error creating download: {str(e)}")
         return False
 
-def load_file_with_encoding(file, file_type: str) -> pd.DataFrame:
-    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
-    try:
-        file.seek(0, 2)
-        file_size = file.tell()
-        file.seek(0)
-        if file_size > Config.MAX_FILE_SIZE:
-            raise ValueError(f"File too large: {file_size / (1024*1024):.1f}MB. Maximum allowed: {Config.MAX_FILE_SIZE / (1024*1024):.1f}MB")
-        for encoding in encodings:
-            try:
-                file.seek(0)
-                if file_type == "csv":
-                    df = pd.read_csv(
-                        file, 
-                        encoding=encoding, 
-                        on_bad_lines='skip',
-                        low_memory=False,
-                        dtype=str,
-                        na_values=['', 'NULL', 'null', 'NA', 'na', 'N/A', 'n/a']
-                    )
-                elif file_type in ["xlsx", "xls"]:
-                    df = pd.read_excel(file, dtype=str, na_values=['', 'NULL', 'null', 'NA', 'na', 'N/A', 'n/a'])
-                if df.empty:
-                    continue
-                return df
-            except UnicodeDecodeError:
-                continue
-            except Exception as e:
-                logger.error(f"Error loading file with {encoding}: {e}")
-                continue
-        raise ValueError(f"Could not read file with any supported encoding: {encodings}")
-    except Exception as e:
-        logger.error(f"File loading error: {e}")
-        raise
-
 def main():
     try:
         st.set_page_config(
-            page_title="Intelligent HRP AI Data Mapper", 
+            page_title="Intelligent healthcare data mapper", 
             layout="wide",
             initial_sidebar_state="expanded"
         )
@@ -177,38 +220,27 @@ def main():
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.markdown(f"""
             <div class="main-header">
-                <h1>🧠 Intelligent HRP AI Data Mapper</h1>
-                <p>Smart field mapping with AI-powered column detection - no rigid formats required!</p>
+                <h1>Intelligent healthcare data mapper</h1>
+                <p>All purpose data mapping solution</p>
                 <small>🗓️ Generated on {now}</small>
             </div>
         """, unsafe_allow_html=True)
-        st.markdown("## 🚀 Enhanced Features")
+        st.markdown("### Features")
         st.markdown("""
-        <div class="feature-grid">
-            <div class="feature-card">
-                <h4>🧠 Smart Detection</h4>
-                <p>AI automatically detects column purposes - no strict naming required</p>
-            </div>
-            <div class="feature-card">
-                <h4>🔄 Flexible Input</h4>
-                <p>Works with any column names and data structures</p>
-            </div>
-            <div class="feature-card">
-                <h4>✨ XML Generation</h4>
-                <p>HRP-compliant XML with validation and formatting</p>
-            </div>
-            <div class="feature-card">
-                <h4>📈 Analytics</h4>
-                <p>Comprehensive mapping statistics and confidence scoring</p>
-            </div>
-        </div>
+        <ul class="feature-list">
+            <li>Upload reference mapping (RAG) and provider data</li>
+            <li>User selects API (FacilityLoad, PractitionerLoad, MemberLoad)</li>
+            <li>Intelligent mapping from provider data to API schema</li>
+            <li>Audit report with mapping, logic, and confidence</li>
+            <li>Download API XML payload and audit report</li>
+            <li>Modern UI and robust error handling</li>
+        </ul>
         """, unsafe_allow_html=True)
 
         with st.sidebar:
             st.header("🛠️ API XML Generator")
             api_name = st.selectbox("Select API to Generate XML", list(API_SCHEMAS.keys()))
             st.header("⚙️ Configuration")
-            show_preview = st.checkbox("Show XML Preview", value=True)
             max_preview = st.slider("Max Preview Records", 1, 10, Config.MAX_PREVIEW_RECORDS)
             pretty_xml = st.checkbox("Pretty Print XML", value=True)
             st.header("📊 Export Options")
@@ -273,18 +305,14 @@ def main():
         st.markdown('<div class="step-header">📦 Step 4: Generate & Download API XML</div>', unsafe_allow_html=True)
         mapped_data = []
         for idx, row in prov_df.iterrows():
-            api_row = {}
-            for api_field in api_fields:
-                prov_col = field_map[api_field]
-                api_row[api_field] = row[prov_col] if prov_col and prov_col in row else ""
+            if api_name == "PractitionerLoad":
+                api_row = derive_practitioner_fields(row)
+            else:
+                api_row = {}
+                for api_field in api_fields:
+                    prov_col = field_map[api_field]
+                    api_row[api_field] = row[prov_col] if prov_col and prov_col in row else ""
             mapped_data.append(api_row)
-
-        if show_preview and mapped_data:
-            preview_count = min(max_preview, len(mapped_data))
-            for i in range(preview_count):
-                xml_content = generate_api_xml(api_name, mapped_data[i], pretty=pretty_xml)
-                with st.expander(f"XML Preview for Record {i+1}", expanded=(i==0)):
-                    st.markdown(f'<div class="xml-preview">{xml_content}</div>', unsafe_allow_html=True)
 
         # Download full XML
         xml_declaration = f'<?xml version="1.0" encoding="{xml_encoding.upper()}"?>\n'
