@@ -373,7 +373,7 @@ def auto_map_healthcare_to_reference(reference_fields: List[str], data_columns: 
         else:
             mapping[ref_field] = None
     return mapping
-    # --- Main Application ---
+# --- Main Application ---
 def main():
     st.set_page_config(
         page_title="Intelligent HRP AI Data Mapper", 
