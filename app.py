@@ -98,13 +98,20 @@ def initialize_rag(reference_dfs: List[pd.DataFrame], embeddings):
             input_variables=["input_field", "schema_fields"]
         )
         
-        # Initialize LLM (xAI Grok API or fallback)
+        # Initialize LLM (HuggingFaceHub or fallback)
         try:
-            from langchain_xai import Grok
-            llm = Grok(api_key=os.getenv("XAI_API_KEY"))
+            from langchain_community.llms import HuggingFaceHub
+            llm = HuggingFaceHub(
+                repo_id="mistralai/Mixtral-8x7B-Instruct-v0.1",
+                huggingfacehub_api_token=os.getenv("HF_API_TOKEN"),
+                model_kwargs={"max_length": 512}
+            )
         except (ImportError, Exception) as e:
-            logger.warning(f"Grok API not available: {str(e)}. Using mock response.")
-            llm = None
+            logger.warning(f"HuggingFace LLM not available: {str(e)}. Using mock response.")
+            from langchain.llms import FakeListLLM
+            llm = FakeListLLM(responses=[
+                '{"map": "Y", "xml_field": "FACILITY_NAME", "logic": "Direct mapping", "reasoning": "Input field matches reference document naming convention"}'
+            ])
         
         # Initialize QA chain
         qa_chain = RetrievalQA.from_chain_type(
@@ -223,6 +230,10 @@ def main():
     )
     
     st.title("Smart Data Mapper")
+    
+    # Debug Python version
+    import sys
+    logger.info(f"Python version: {sys.version}")
     
     # Initialize components
     embedder, embeddings, ai_error = safe_import_components()
