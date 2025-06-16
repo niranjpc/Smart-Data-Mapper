@@ -7,7 +7,7 @@ from datetime import datetime
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
-# --- Settings: API Templates (can be extended or loaded from Streamlit secrets/config) ---
+# --- Settings: API Templates ---
 API_SCHEMAS = {
     "PractitionerLoad": {
         "root": "Practitioners",
@@ -92,11 +92,10 @@ API_SCHEMAS = {
     }
 }
 
-# --- Hugging Face LLM Inference ---
 def get_hf_token():
     return st.secrets.get("HF_TOKEN") or os.getenv("HF_TOKEN")
 
-def hf_inference(prompt, model="mistralai/Mixtral-8x7B-Instruct-v0.1", max_new_tokens=2048, temperature=0.1):
+def hf_inference(prompt, model="mistralai/Mixtral-8x7B-Instruct-v0.1", max_new_tokens=1024, temperature=0.1):
     HF_TOKEN = get_hf_token()
     if not HF_TOKEN:
         st.error("Hugging Face API key not found. Please set HF_TOKEN in Streamlit secrets or environment.")
@@ -107,12 +106,14 @@ def hf_inference(prompt, model="mistralai/Mixtral-8x7B-Instruct-v0.1", max_new_t
         "inputs": prompt,
         "parameters": {
             "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
-            "return_full_text": False,
+            "temperature": temperature
         }
     }
     response = requests.post(api_url, headers=headers, json=payload)
-    response.raise_for_status()
+    st.write("HF API response:", response.text)  # Debug output
+    if response.status_code != 200:
+        st.error(f"HF API returned status {response.status_code}: {response.text}")
+        st.stop()
     result = response.json()
     if isinstance(result, list) and "generated_text" in result[0]:
         return result[0]["generated_text"]
@@ -124,7 +125,6 @@ def hf_inference(prompt, model="mistralai/Mixtral-8x7B-Instruct-v0.1", max_new_t
         return result["choices"][0]["text"]
     return str(result)
 
-# --- XML Generation ---
 def build_xml(records, api_schema, pretty_print=True):
     root = ET.Element(api_schema["root"])
     for record in records:
@@ -140,7 +140,6 @@ def build_xml(records, api_schema, pretty_print=True):
         return '\n'.join(lines).strip()
     return xml_str
 
-# --- Streamlit UI ---
 st.set_page_config(page_title="Intelligent healthcare data mapper", layout="wide")
 st.markdown("""
     <div class="main-header">
@@ -148,15 +147,6 @@ st.markdown("""
         <p>comprehensive data mapping solution</p>
         <small>🤖 LLM + RAG powered mapping (Hugging Face)</small>
     </div>
-""", unsafe_allow_html=True)
-st.markdown("## Features")
-st.markdown("""
-<ul class='feature-list'>
-    <li>🧠 LLM+RAG: AI-powered field mapping using your reference file as context</li>
-    <li>🔄 Flexible Input: Any column names and data structures</li>
-    <li>✨ XML Generation: API-compliant XML with validation and formatting</li>
-    <li>📈 Audit: See and edit how each field was mapped</li>
-</ul>
 """, unsafe_allow_html=True)
 
 with st.sidebar:
@@ -183,7 +173,7 @@ data_df = pd.read_csv(data_file) if data_file.name.endswith(".csv") else pd.read
 # --- LLM+RAG Mapping ---
 st.markdown('<div class="step-header">🔍 Step 3: AI Mapping (LLM + RAG)</div>', unsafe_allow_html=True)
 
-def get_llm_mapping(rag_df, data_df, api_schema, api_choice, max_fields=15, max_examples=10):
+def get_llm_mapping(rag_df, data_df, api_schema, api_choice, max_fields=5, max_examples=3):
     xml_fields = [f[0] for f in api_schema["fields"]][:max_fields]
     reference_examples = rag_df.head(max_examples).to_dict(orient="records")
     data_columns = list(data_df.columns)
@@ -245,14 +235,11 @@ for xml_field, desc in api_schema["fields"]:
 mapping_df = pd.DataFrame(mapping_table)
 edited_df = st.data_editor(mapping_df, use_container_width=True, num_rows="dynamic", key="mapping_editor")
 
-# --- Highlight unmapped fields ---
 if any(edited_df["Mapped Input Field"] == ""):
     st.warning("Some XML fields are not mapped. Please review and edit as needed.")
 
-# --- XML Generation ---
 st.markdown('<div class="step-header">📦 Step 5: Download Results</div>', unsafe_allow_html=True)
 if st.button("Generate & Download XML and Audit Report"):
-    # Build records for XML
     records = []
     for _, row in data_df.iterrows():
         rec = {}
