@@ -1,9 +1,10 @@
 streamlit==1.32.2
-pandas==2.2.1  # Updated for Python 3.13
+pandas==2.2.1
 numpy==1.26.4
 langchain==0.1.16
 sentence-transformers==2.7.0
 transformers==4.38.2
-chromadb==0.4.24  # FAISS alternative
+chromadb==0.4.24
 python-dotenv==1.0.1
 openpyxl==3.1.2
+langchain-community==0.0.29
