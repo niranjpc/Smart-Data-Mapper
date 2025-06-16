@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 class Config:
-    MAX_PREVIEW_RECORDS = 5
     XML_INDENT = "  "
     SUPPORTED_FORMATS = ["csv", "xlsx", "xls"]
     DEFAULT_ENCODING = "utf-8"
@@ -136,6 +135,7 @@ def load_custom_css():
     except Exception as e:
         logger.error(f"Error loading CSS: {e}")
         st.error("CSS loading failed, but the app will continue to work.")
+
 def build_dynamic_xml(row: pd.Series, pretty_print: bool = False) -> str:
     try:
         root = ET.Element("Provider")
@@ -403,12 +403,7 @@ def main():
         """, unsafe_allow_html=True)
         with st.sidebar:
             st.header("⚙️ Configuration")
-            show_preview = st.checkbox("Show XML Preview", value=True)
-            max_preview = st.slider("Max Preview Records", 1, 10, Config.MAX_PREVIEW_RECORDS)
             pretty_xml = st.checkbox("Pretty Print XML", value=True)
-            st.header("🎯 Detection Settings")
-            similarity_threshold = st.slider("Column Similarity Threshold", 0.1, 1.0, Config.SIMILARITY_THRESHOLD, 0.1)
-            Config.SIMILARITY_THRESHOLD = similarity_threshold
             st.header("📊 Export Options")
             include_stats = st.checkbox("Include Statistics in Report", value=True)
             xml_encoding = st.selectbox("XML Encoding", ["UTF-8", "ISO-8859-1"], index=0)
@@ -459,7 +454,7 @@ def main():
                     error_msg += "\n".join(rag_errors + prov_errors)
                     st.error(error_msg)
                     st.stop()
-            st.markdown('<div class="step-header">🔍 AI Analysis Results</div>', unsafe_allow_html=True)
+            st.markdown('<div class="step-header">🔍 Step 3: AI Analysis Results</div>', unsafe_allow_html=True)
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("📊 Columns Detected", analysis['total_columns'])
@@ -550,130 +545,4 @@ def main():
                         xml_row = {}
                         for prov_col, xml_path in field_map.items():
                             if prov_col in row:
-                                xml_row[xml_path] = row[prov_col]
-                        mapped_data.append(xml_row)
-                    except Exception as e:
-                        logger.error(f"Error processing row {idx}: {e}")
-                        continue
-        except Exception as e:
-            st.error(f"Error transforming data: {str(e)}")
-            logger.error(f"Data transformation error: {traceback.format_exc()}")
-            st.stop()
-        if show_preview and mapped_data:
-            st.markdown('<div class="step-header">🔍 Step 4: XML Preview</div>', unsafe_allow_html=True)
-            try:
-                sample_df = pd.DataFrame(mapped_data)
-                preview_count = min(max_preview, len(sample_df))
-                for i in range(preview_count):
-                    xml_content = build_dynamic_xml(sample_df.iloc[i], pretty_print=pretty_xml)
-                    with st.expander(f"🏥 Provider {i+1} XML Preview", expanded=i == 0):
-                        st.markdown(f'<div class="xml-preview">{xml_content}</div>', unsafe_allow_html=True)
-            except Exception as e:
-                st.warning(f"Error generating preview: {str(e)}")
-        st.markdown('<div class="step-header">📦 Step 5: Export Results</div>', unsafe_allow_html=True)
-        try:
-            encoding_map = {"UTF-8": "utf-8", "ISO-8859-1": "iso-8859-1"}
-            selected_encoding = encoding_map[xml_encoding]
-            xml_declaration = f'<?xml version="1.0" encoding="{selected_encoding.upper()}"?>\n'
-            xml_providers = []
-            for row_data in mapped_data:
-                xml_providers.append(build_dynamic_xml(pd.Series(row_data), pretty_print=pretty_xml))
-            full_xml = xml_declaration + '<Providers>\n' + '\n'.join(xml_providers) + '\n</Providers>'
-            col1, col2 = st.columns(2)
-            with col1:
-                create_safe_download_button(
-                    "📥 Download Complete XML File",
-                    full_xml,
-                    f"hrp_providers_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml",
-                    "application/xml"
-                )
-            with col2:
-                try:
-                    audit_df = pd.DataFrame(audit_rows)
-                    if include_stats:
-                        stats_rows = []
-                        for key, value in stats.items():
-                            if key != 'unmapped_column_list':
-                                stats_rows.append({"Metric": key.replace('_', ' ').title(), "Value": str(value)})
-                        output = io.BytesIO()
-                        try:
-                            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                                audit_df.to_excel(writer, sheet_name='Mapping_Audit', index=False)
-                                pd.DataFrame(stats_rows).to_excel(writer, sheet_name='Statistics', index=False)
-                            create_safe_download_button(
-                                "📊 Download Audit Report (Excel)",
-                                output,
-                                f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                            )
-                        except Exception as e:
-                            st.warning(f"Excel export failed: {str(e)}. Falling back to CSV.")
-                            csv_data = audit_df.to_csv(index=False)
-                            create_safe_download_button(
-                                "📊 Download Audit Report (CSV)",
-                                csv_data,
-                                f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                "text/csv"
-                            )
-                    else:
-                        csv_data = audit_df.to_csv(index=False)
-                        create_safe_download_button(
-                            "📊 Download Audit Report (CSV)",
-                            csv_data,
-                            f"hrp_audit_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            "text/csv"
-                        )
-                except Exception as e:
-                    st.error(f"Error creating audit report: {str(e)}")
-        except Exception as e:
-            st.error(f"Error generating exports: {str(e)}")
-            logger.error(f"Export generation error: {traceback.format_exc()}")
-        try:
-            st.markdown('<div class="step-header">📋 Mapping Audit Report</div>', unsafe_allow_html=True)
-            if audit_rows:
-                audit_df = pd.DataFrame(audit_rows)
-                col1, col2 = st.columns(2)
-                with col1:
-                    status_filter = st.selectbox(
-                        "Filter by Status:",
-                        ["All", "✅ Mapped", "⚠️ Not Found in Provider Data"],
-                        index=0
-                    )
-                with col2:
-                    mapping_types = list(audit_df["Mapping Type"].unique()) if not audit_df.empty else []
-                    mapping_type_filter = st.selectbox(
-                        "Filter by Mapping Type:",
-                        ["All"] + mapping_types,
-                        index=0
-                    )
-                display_df = audit_df.copy()
-                if status_filter != "All":
-                    display_df = display_df[display_df["Status"] == status_filter]
-                if mapping_type_filter != "All":
-                    display_df = display_df[display_df["Mapping Type"] == mapping_type_filter]
-                st.dataframe(display_df, use_container_width=True)
-            else:
-                st.warning("No audit data available.")
-            st.markdown(f"""
-            <div class="stats-container">
-                <h4>📊 Processing Summary</h4>
-                <p><strong>{len(prov_df)}</strong> provider records processed | 
-                <strong>{stats['mapped_columns']}</strong> fields mapped | 
-                <strong>{stats['mapping_coverage']:.1f}%</strong> coverage achieved</p>
-            </div>
-            """, unsafe_allow_html=True)
-        except Exception as e:
-            st.error(f"Error displaying audit report: {str(e)}")
-            logger.error(f"Audit report display error: {traceback.format_exc()}")
-    except Exception as e:
-        st.error(f"Critical application error: {str(e)}")
-        logger.error(f"Critical error: {traceback.format_exc()}")
-        st.markdown("""
-        <div class="error-box">
-            <h4>❌ Application Error</h4>
-            <p>A critical error occurred. Please check your input files and try again.</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-if __name__ == "__main__":
-    main()
+                                xml_row[xml_path] = row[prov_col
