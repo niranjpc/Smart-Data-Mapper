@@ -9,11 +9,11 @@ import io
 import logging
 from typing import List, Dict
 import time
-from langchain_community.document_loaders import DataFrameLoader
-from langchain_community.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # --- Configuration ---
 class Config:
@@ -43,11 +43,10 @@ def safe_import_components():
     try:
         from sentence_transformers import SentenceTransformer
         from langchain_community.embeddings import HuggingFaceEmbeddings
-        # Initialize models with explicit device='cpu' to avoid device issues
         embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
         embeddings = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2', model_kwargs={'device': 'cpu'})
         return embedder, embeddings, None
-    except (ImportError, NotImplementedError, RuntimeError) as e:
+    except (ImportError, RuntimeError, Exception) as e:
         logger.warning(f"AI components not available: {str(e)}")
         return None, None, f"AI features disabled: {str(e)}"
 
@@ -56,6 +55,12 @@ def initialize_rag(reference_dfs: List[pd.DataFrame], embeddings):
     if not reference_dfs or embeddings is None:
         return None
     try:
+        from langchain_community.document_loaders import DataFrameLoader
+        from langchain_community.vectorstores import Chroma
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+        from langchain.chains import RetrievalQA
+        from langchain.prompts import PromptTemplate
+        
         # Convert DataFrames to LangChain documents
         documents = []
         for df in reference_dfs:
@@ -93,9 +98,17 @@ def initialize_rag(reference_dfs: List[pd.DataFrame], embeddings):
             input_variables=["input_field", "schema_fields"]
         )
         
-        # Mock RAG response (replace with xAI Grok API in production)
+        # Initialize LLM (xAI Grok API or fallback)
+        try:
+            from langchain_xai import Grok
+            llm = Grok(api_key=os.getenv("XAI_API_KEY"))
+        except (ImportError, Exception) as e:
+            logger.warning(f"Grok API not available: {str(e)}. Using mock response.")
+            llm = None
+        
+        # Initialize QA chain
         qa_chain = RetrievalQA.from_chain_type(
-            llm=None,  # No LLM for MVP; rely on mock response
+            llm=llm,
             chain_type="stuff",
             retriever=vectorstore.as_retriever(),
             return_source_documents=True,
@@ -113,10 +126,11 @@ def map_fields_with_ai(embedder, qa_chain, source_fields: List[str], target_fiel
         try:
             if qa_chain:
                 try:
-                    # Mock RAG response
-                    result = {
-                        "result": f'{{"map": "Y", "xml_field": "{target_fields[0]}", "logic": "Direct mapping", "reasoning": "Input field matches reference document naming convention"}}'
-                    }
+                    result = qa_chain({
+                        "query": f"Map input field '{field}' to schema fields {target_fields}",
+                        "input_field": field,
+                        "schema_fields": target_fields
+                    })
                     mapping = eval(result["result"])
                 except Exception as e:
                     logger.error(f"RAG mapping failed for {field}: {str(e)}")
@@ -124,7 +138,7 @@ def map_fields_with_ai(embedder, qa_chain, source_fields: List[str], target_fiel
                         "map": "N",
                         "xml_field": "",
                         "logic": "",
-                        "reasoning": "RAG mapping failed"
+                        "reasoning": f"RAG mapping failed: {str(e)}"
                     }
             elif embedder:
                 source_emb = embedder.encode([field])
@@ -302,13 +316,23 @@ def main():
                 with col1:
                     if st.button("Generate Mapper Sheet"):
                         mapper_df = pd.DataFrame(st.session_state.mappings)
-                        buffer = io.BytesIO()
-                        mapper_df.to_excel(buffer, index=False, engine='openpyxl')
+                        # Excel download
+                        excel_buffer = io.BytesIO()
+                        mapper_df.to_excel(excel_buffer, index=False, engine='openpyxl')
                         st.download_button(
-                            "Download Mapper Sheet",
-                            buffer.getvalue(),
+                            label="Download Mapper Sheet (Excel)",
+                            data=excel_buffer.getvalue(),
                             file_name=f"mapper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                        # CSV download
+                        csv_buffer = io.StringIO()
+                        mapper_df.to_csv(csv_buffer, index=False)
+                        st.download_button(
+                            label="Download Mapper Sheet (CSV)",
+                            data=csv_buffer.getvalue().encode('utf-8'),
+                            file_name=f"mapper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
                         )
                 
                 with col2:
@@ -339,7 +363,7 @@ def main():
                                         zf.writestr(f"record_{timestamp}_{i+1}.xml", xml)
                                 
                                 st.download_button(
-                                    "Download XMLs",
+                                    label="Download XMLs",
                                     data=zip_buffer.getvalue(),
                                     file_name=f"mappings_{timestamp}.zip",
                                     mime="application/zip"
