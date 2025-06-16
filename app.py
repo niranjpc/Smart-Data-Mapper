@@ -2,24 +2,21 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime
-import json
-import logging
-from typing import Dict, List
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import zipfile
 import io
-import sys
-import subprocess
+import logging
+from typing import List, Dict
 
 # --- Configuration ---
 class Config:
     MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
     SUPPORTED_FILE_TYPES = ["csv", "xlsx"]
     XML_SCHEMAS = {
-        "FacilityLoad": "schemas/facility_load.xsd",
-        "PractitionerLoad": "schemas/practitioner_load.xsd",
-        "MemberEnrollment": "schemas/member_enrollment.xsd"
+        "FacilityLoad": "Facility",
+        "PractitionerLoad": "Practitioner",
+        "MemberEnrollment": "Member"
     }
 
 # --- Logging ---
@@ -29,66 +26,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Initialize AI Components ---
-def initialize_ai():
-    """Lazy-load AI components to improve startup time"""
-    if "ai_initialized" not in st.session_state:
-        with st.spinner("Loading AI components (first run only)..."):
+def initialize_components():
+    """Lazy-load heavy components"""
+    if "components_initialized" not in st.session_state:
+        with st.spinner("Loading AI components..."):
             try:
                 from sentence_transformers import SentenceTransformer
-                from langchain_community.vectorstores import Chroma
-                from langchain.embeddings import HuggingFaceEmbeddings
-                
                 st.session_state.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-                st.session_state.VectorStore = Chroma
-                st.session_state.embeddings = HuggingFaceEmbeddings(
-                    model_name="sentence-transformers/all-MiniLM-L6-v2"
-                )
-                st.session_state.ai_initialized = True
+                st.session_state.components_initialized = True
             except ImportError as e:
-                st.error(f"Critical dependency error: {str(e)}")
-                logger.exception("AI initialization failed")
+                st.error(f"Failed to load AI components: {str(e)}")
                 st.stop()
 
-# --- File Processing ---
-def process_uploaded_file(file):
-    """Validate and load uploaded file"""
+def process_file(file):
+    """Handle file upload and validation"""
     if file.size > Config.MAX_FILE_SIZE:
         st.error(f"File exceeds {Config.MAX_FILE_SIZE/1024/1024}MB limit")
         return None
     
     try:
         if file.type == "text/csv":
-            df = pd.read_csv(file)
-        else:
-            df = pd.read_excel(file, engine='openpyxl')
-        
-        st.success(f"Loaded {len(df)} records with {len(df.columns)} fields")
-        return df
+            return pd.read_csv(file)
+        return pd.read_excel(file, engine='openpyxl')
     except Exception as e:
         st.error(f"Error loading file: {str(e)}")
-        logger.exception("File processing error")
         return None
 
-# --- XML Generation ---
-def generate_xml(mapped_data: List[Dict], api_schema: str) -> str:
-    """Generate validated XML output"""
-    root = ET.Element(api_schema)
-    
+def generate_xml(mapped_data: List[Dict], root_element: str) -> str:
+    """Generate XML from mapped data"""
+    root = ET.Element(root_element)
     for field in mapped_data:
-        if field.get("confidence", 0) > 0.6:  # Confidence threshold
-            elem = ET.SubElement(root, field["target"])
-            elem.text = str(field["value"])
-    
-    return prettify_xml(root)
+        if field.get('confidence', 0) > 0.5:
+            elem = ET.SubElement(root, field['target'])
+            elem.text = str(field['value'])
+    return minidom.parseString(ET.tostring(root)).toprettyxml()
 
-def prettify_xml(element) -> str:
-    """Format XML with proper indentation"""
-    rough_string = ET.tostring(element, 'utf-8')
-    reparsed = minidom.parseString(rough_string)
-    return reparsed.toprettyxml(indent="  ")
-
-# --- Main Application ---
 def main():
     st.set_page_config(
         page_title="Healthcare Data Mapper",
@@ -96,37 +68,28 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    st.title("Intelligent Healthcare Data Mapper")
-    st.write("AI-powered field mapping with compliance validation")
+    st.title("Healthcare Data Mapper")
     
-    # Initialize session state
-    if "mappings" not in st.session_state:
-        st.session_state.mappings = []
-    
-    # Sidebar Configuration
+    # API Selection
     selected_api = st.sidebar.selectbox(
         "Select HRP API",
-        list(Config.XML_SCHEMAS.keys()),
-        help="Choose the target API specification"
+        list(Config.XML_SCHEMAS.keys())
     )
     
-    # File Upload Section
+    # File Upload
     st.header("1. Data Upload")
     file = st.file_uploader(
         "Upload Provider Data",
-        type=Config.SUPPORTED_FILE_TYPES,
-        help="CSV or Excel file with source data"
+        type=Config.SUPPORTED_FILE_TYPES
     )
     
     if file:
-        df = process_uploaded_file(file)
-        
+        df = process_file(file)
         if df is not None:
-            # Initialize AI components only when needed
-            initialize_ai()
+            initialize_components()
             
-            # Field Mapping Section
-            with st.expander("Field Mapping Configuration", expanded=True):
+            # Field Mapping
+            with st.expander("Field Mapping", expanded=True):
                 sample_fields = st.multiselect(
                     "Select fields to map",
                     df.columns.tolist(),
@@ -134,55 +97,42 @@ def main():
                 )
                 
                 if st.button("Generate Mappings"):
-                    with st.spinner("Analyzing fields with AI..."):
-                        from langchain.schema import Document
-                        from langchain.embeddings import HuggingFaceEmbeddings
-                        
-                        # Simplified mapping logic for demo
-                        temp_mappings = []
-                        for field in (sample_fields if sample_fields else df.columns):
-                            temp_mappings.append({
-                                "source": field,
-                                "target": field.upper().replace(" ", "_"),
-                                "value": "",
-                                "confidence": 0.9  # Mock confidence
-                            })
-                        st.session_state.mappings = temp_mappings
+                    with st.spinner("Creating mappings..."):
+                        st.session_state.mappings = [{
+                            "source": field,
+                            "target": field.upper().replace(" ", "_"),
+                            "value": "",
+                            "confidence": 0.9
+                        } for field in (sample_fields or df.columns)]
             
-            # Results Display
-            if st.session_state.mappings:
-                st.header("2. Mapping Results")
+            # Results
+            if "mappings" in st.session_state:
+                st.header("2. Results")
                 st.dataframe(pd.DataFrame(st.session_state.mappings))
                 
-                # XML Generation
                 if st.button("Generate XML"):
-                    with st.spinner("Building XML payloads..."):
+                    with st.spinner("Generating XML..."):
                         xml_outputs = []
                         for _, row in df.iterrows():
-                            mapped_data = []
-                            for m in st.session_state.mappings:
-                                mapped_data.append({
-                                    **m,
-                                    "value": row[m["source"]]
-                                })
-                            xml_outputs.append(generate_xml(mapped_data, selected_api))
+                            mapped_data = [{**m, "value": row[m["source"]]} 
+                                        for m in st.session_state.mappings]
+                            xml_outputs.append(generate_xml(
+                                mapped_data, 
+                                Config.XML_SCHEMAS[selected_api]
+                            ))
                         
-                        # Create downloadable ZIP
+                        # Create ZIP
                         zip_buffer = io.BytesIO()
                         with zipfile.ZipFile(zip_buffer, "a") as zf:
                             for i, xml in enumerate(xml_outputs):
                                 zf.writestr(f"record_{i+1}.xml", xml)
                         
                         st.download_button(
-                            label="Download All Files (ZIP)",
+                            "Download XMLs",
                             data=zip_buffer.getvalue(),
-                            file_name="hrp_mapping_output.zip",
+                            file_name="mappings.zip",
                             mime="application/zip"
                         )
-                        
-                        # Show sample
-                        with st.expander("Sample XML Output"):
-                            st.code(xml_outputs[0], language="xml")
 
 if __name__ == "__main__":
     main()
