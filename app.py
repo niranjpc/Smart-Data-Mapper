@@ -43,10 +43,13 @@ def safe_import_components():
     try:
         from sentence_transformers import SentenceTransformer
         from langchain_community.embeddings import HuggingFaceEmbeddings
-        return SentenceTransformer('all-MiniLM-L6-v2'), HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2'), None
-    except ImportError as e:
+        # Initialize models with explicit device='cpu' to avoid device issues
+        embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+        embeddings = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2', model_kwargs={'device': 'cpu'})
+        return embedder, embeddings, None
+    except (ImportError, NotImplementedError, RuntimeError) as e:
         logger.warning(f"AI components not available: {str(e)}")
-        return None, None, "AI features disabled"
+        return None, None, f"AI features disabled: {str(e)}"
 
 def initialize_rag(reference_dfs: List[pd.DataFrame], embeddings):
     """Initialize RAG with reference documents"""
@@ -90,15 +93,9 @@ def initialize_rag(reference_dfs: List[pd.DataFrame], embeddings):
             input_variables=["input_field", "schema_fields"]
         )
         
-        # Mock LLM (replace with xAI Grok API in production)
-        from langchain.llms import FakeListLLM
-        llm = FakeListLLM(responses=[
-            '{"map": "Y", "xml_field": "FACILITY_NAME", "logic": "Direct mapping", "reasoning": "Input field matches reference document naming convention"}'
-        ])
-        
-        # Initialize QA chain
+        # Mock RAG response (replace with xAI Grok API in production)
         qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
+            llm=None,  # No LLM for MVP; rely on mock response
             chain_type="stuff",
             retriever=vectorstore.as_retriever(),
             return_source_documents=True,
@@ -108,6 +105,65 @@ def initialize_rag(reference_dfs: List[pd.DataFrame], embeddings):
     except Exception as e:
         logger.error(f"RAG initialization failed: {str(e)}")
         return None
+
+def map_fields_with_ai(embedder, qa_chain, source_fields: List[str], target_fields: List[str]) -> List[Dict]:
+    """Map source fields to target fields using AI embeddings or RAG"""
+    mappings = []
+    for i, field in enumerate(source_fields):
+        try:
+            if qa_chain:
+                try:
+                    # Mock RAG response
+                    result = {
+                        "result": f'{{"map": "Y", "xml_field": "{target_fields[0]}", "logic": "Direct mapping", "reasoning": "Input field matches reference document naming convention"}}'
+                    }
+                    mapping = eval(result["result"])
+                except Exception as e:
+                    logger.error(f"RAG mapping failed for {field}: {str(e)}")
+                    mapping = {
+                        "map": "N",
+                        "xml_field": "",
+                        "logic": "",
+                        "reasoning": "RAG mapping failed"
+                    }
+            elif embedder:
+                source_emb = embedder.encode([field])
+                target_emb = embedder.encode(target_fields)
+                similarities = np.dot(source_emb, target_emb.T)[0]
+                best_match_idx = np.argmax(similarities)
+                mapping = {
+                    "map": "Y",
+                    "xml_field": target_fields[best_match_idx],
+                    "logic": "Semantic similarity",
+                    "reasoning": f"Matched based on embedding similarity ({similarities[best_match_idx]:.2f})"
+                }
+            else:
+                mapping = {
+                    "map": "Y",
+                    "xml_field": field.upper().replace(" ", "_"),
+                    "logic": "Direct mapping",
+                    "reasoning": "Default mapping due to missing AI components"
+                }
+            
+            mappings.append({
+                "si": i + 1,
+                "input_field": field,
+                "map": mapping["map"],
+                "xml_field": mapping["xml_field"],
+                "logic": mapping["logic"],
+                "comments": mapping["reasoning"]
+            })
+        except Exception as e:
+            logger.error(f"Mapping failed for {field}: {str(e)}")
+            mappings.append({
+                "si": i + 1,
+                "input_field": field,
+                "map": "N",
+                "xml_field": "",
+                "logic": "",
+                "comments": f"Mapping error: {str(e)}"
+            })
+    return mappings
 
 def process_file(file, is_reference=False):
     """Handle file upload safely"""
@@ -123,63 +179,6 @@ def process_file(file, is_reference=False):
     except Exception as e:
         st.error(f"Error loading file: {str(e)}")
         return None
-
-def map_fields_with_ai(embedder, qa_chain, source_fields: List[str], target_fields: List[str]) -> List[Dict]:
-    """Map source fields to target fields using AI embeddings or RAG"""
-    if qa_chain:
-        mappings = []
-        for field in source_fields:
-            try:
-                result = qa_chain({
-                    "query": f"Map input field '{field}' to schema fields {target_fields}",
-                    "input_field": field,
-                    "schema_fields": target_fields
-                })
-                mapping = eval(result["result"])  # Parse JSON response
-                mappings.append({
-                    "si": len(mappings) + 1,
-                    "input_field": field,
-                    "map": mapping["map"],
-                    "xml_field": mapping["xml_field"] if mapping["map"] == "Y" else "",
-                    "logic": mapping["logic"] if mapping["map"] == "Y" else "",
-                    "comments": mapping["reasoning"]
-                })
-            except Exception as e:
-                logger.error(f"AI mapping failed for {field}: {str(e)}")
-                mappings.append({
-                    "si": len(mappings) + 1,
-                    "input_field": field,
-                    "map": "N",
-                    "xml_field": "",
-                    "logic": "",
-                    "comments": "AI mapping failed"
-                })
-        return mappings
-    elif embedder:
-        source_emb = embedder.encode(source_fields)
-        target_emb = embedder.encode(target_fields)
-        similarities = np.dot(source_emb, target_emb.T)
-        mappings = []
-        for i, source in enumerate(source_fields):
-            best_match_idx = np.argmax(similarities[i])
-            mappings.append({
-                "si": i + 1,
-                "input_field": source,
-                "map": "Y",
-                "xml_field": target_fields[best_match_idx],
-                "logic": "Semantic similarity",
-                "comments": f"Matched based on embedding similarity ({similarities[i][best_match_idx]:.2f})"
-            })
-        return mappings
-    else:
-        return [{
-            "si": i + 1,
-            "input_field": f,
-            "map": "Y",
-            "xml_field": f.upper().replace(" ", "_"),
-            "logic": "Direct mapping",
-            "comments": "Default mapping due to missing AI components"
-        } for i, f in enumerate(source_fields)]
 
 def generate_xml(mapped_data: List[Dict], row: pd.Series, root_element: str, valid_fields: List[str]) -> str:
     """Generate XML with validation"""
