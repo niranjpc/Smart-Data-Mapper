@@ -1,3 +1,11 @@
+import sys
+import subprocess
+# Install missing packages dynamically
+try:
+    from langchain.vectorstores import FAISS
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu==1.8.0"])
+    from langchain.vectorstores import FAISS
 import streamlit as st
 import pandas as pd
 import numpy as np
