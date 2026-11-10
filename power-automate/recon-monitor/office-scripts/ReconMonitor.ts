@@ -319,7 +319,7 @@ function main(workbook: ExcelScript.Workbook, configJson: string = "", asOf: str
 
 /* ======================= reading helpers ======================= */
 
-/** Account key: case, spacing and punctuation do not matter ("MedStar" = "Medstar", "Zing Health" = "ZingHealth"). */
+/** Account key: case, spacing and punctuation do not matter ("PlanOne" = "Planone", "Plan Two" = "PlanTwo"). */
 function loose(s: string): string { return norm(s).replace(/[^a-z0-9]/g, ""); }
 
 /** Tables inside a sheet: one per header row (a row with a Variance column, or with account + date columns). */
