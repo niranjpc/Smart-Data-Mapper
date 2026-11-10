@@ -6,13 +6,31 @@
     "note": "Reference definition: what 'Peek code' shows for each step once the flow is built in the designer. Values in CAPITALS are tenant-specific and are picked in the designer. See ../README.md."
   },
   "parameters": {
-    "$connections": { "defaultValue": {}, "type": "Object" },
-    "$authentication": { "defaultValue": {}, "type": "SecureObject" }
+    "$connections": {
+      "defaultValue": {},
+      "type": "Object"
+    },
+    "$authentication": {
+      "defaultValue": {},
+      "type": "SecureObject"
+    }
   },
   "triggers": {
     "Every_morning": {
       "type": "Recurrence",
-      "recurrence": { "frequency": "Day", "interval": 1, "timeZone": "Eastern Standard Time", "schedule": { "hours": ["7"], "minutes": [15] } }
+      "recurrence": {
+        "frequency": "Day",
+        "interval": 1,
+        "timeZone": "Eastern Standard Time",
+        "schedule": {
+          "hours": [
+            "7"
+          ],
+          "minutes": [
+            15
+          ]
+        }
+      }
     }
   },
   "actions": {
@@ -26,26 +44,53 @@
         "pageUrl": "https://TENANT.sharepoint.com/sites/TechOps/SitePages/Recon-This-week.aspx",
         "timeZone": "Eastern Standard Time",
         "mailTo": "techops-recon@TENANT.com",
-        "lists": ["Recon Summary", "Recon Interfaces", "Recon Issues", "Recon Daily Trend", "Recon Weekly Scorecard", "Recon Recurring Issues"]
+        "lists": [
+          "Recon Summary",
+          "Recon Interfaces",
+          "Recon Issues",
+          "Recon Daily Trend",
+          "Recon Weekly Scorecard",
+          "Recon Recurring Issues"
+        ]
       }
     },
     "Get_config": {
       "type": "OpenApiConnection",
-      "runAfter": { "Settings": ["Succeeded"] },
+      "runAfter": {
+        "Settings": [
+          "Succeeded"
+        ]
+      },
       "inputs": {
-        "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline", "connectionName": "shared_sharepointonline", "operationId": "GetFileContentByPath" },
-        "parameters": { "dataset": "@outputs('Settings')?['siteUrl']", "path": "@outputs('Settings')?['configPath']", "inferContentType": false },
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+          "connectionName": "shared_sharepointonline",
+          "operationId": "GetFileContentByPath"
+        },
+        "parameters": {
+          "dataset": "@outputs('Settings')?['siteUrl']",
+          "path": "@outputs('Settings')?['configPath']",
+          "inferContentType": false
+        },
         "authentication": "@parameters('$authentication')"
       }
     },
     "Get_archived_weeks": {
       "type": "OpenApiConnection",
-      "runAfter": { "Settings": ["Succeeded"] },
+      "runAfter": {
+        "Settings": [
+          "Succeeded"
+        ]
+      },
       "inputs": {
-        "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline", "connectionName": "shared_sharepointonline", "operationId": "GetFileItems" },
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+          "connectionName": "shared_sharepointonline",
+          "operationId": "GetFileItems"
+        },
         "parameters": {
           "dataset": "@outputs('Settings')?['siteUrl']",
-          "table": "DOCUMENT_LIBRARY_HOLDING_THE_ARCHIVE",
+          "table": "PICK_ARCHIVE_LIBRARY_IN_DESIGNER",
           "$filter": "FSObjType eq 0",
           "$orderby": "Modified asc",
           "$top": 500,
@@ -57,7 +102,11 @@
     },
     "Only_workbooks": {
       "type": "Query",
-      "runAfter": { "Get_archived_weeks": ["Succeeded"] },
+      "runAfter": {
+        "Get_archived_weeks": [
+          "Succeeded"
+        ]
+      },
       "inputs": {
         "from": "@body('Get_archived_weeks')?['value']",
         "where": "@and(or(endsWith(toLower(item()?['{FilenameWithExtension}']), '.xlsx'), endsWith(toLower(item()?['{FilenameWithExtension}']), '.xlsm')), not(startsWith(item()?['{FilenameWithExtension}'], '~')))"
@@ -65,35 +114,86 @@
     },
     "Initialize_archive": {
       "type": "InitializeVariable",
-      "runAfter": { "Only_workbooks": ["Succeeded"] },
-      "inputs": { "variables": [{ "name": "archive", "type": "array", "value": [] }] }
+      "runAfter": {
+        "Only_workbooks": [
+          "Succeeded"
+        ]
+      },
+      "inputs": {
+        "variables": [
+          {
+            "name": "archive",
+            "type": "array",
+            "value": []
+          }
+        ]
+      }
     },
     "Initialize_lists": {
       "type": "InitializeVariable",
-      "runAfter": { "Initialize_archive": ["Succeeded"] },
-      "inputs": { "variables": [{ "name": "lists", "type": "array", "value": [] }] }
+      "runAfter": {
+        "Initialize_archive": [
+          "Succeeded"
+        ]
+      },
+      "inputs": {
+        "variables": [
+          {
+            "name": "lists",
+            "type": "array",
+            "value": []
+          }
+        ]
+      }
     },
     "Initialize_errors": {
       "type": "InitializeVariable",
-      "runAfter": { "Initialize_lists": ["Succeeded"] },
-      "inputs": { "variables": [{ "name": "errors", "type": "array", "value": [] }] }
+      "runAfter": {
+        "Initialize_lists": [
+          "Succeeded"
+        ]
+      },
+      "inputs": {
+        "variables": [
+          {
+            "name": "errors",
+            "type": "array",
+            "value": []
+          }
+        ]
+      }
     },
     "For_each_archived_week": {
       "type": "Foreach",
-      "runAfter": { "Initialize_errors": ["Succeeded"], "Get_config": ["Succeeded"] },
+      "runAfter": {
+        "Initialize_errors": [
+          "Succeeded"
+        ],
+        "Get_config": [
+          "Succeeded"
+        ]
+      },
       "foreach": "@body('Only_workbooks')",
-      "runtimeConfiguration": { "concurrency": { "repetitions": 1 } },
+      "runtimeConfiguration": {
+        "concurrency": {
+          "repetitions": 1
+        }
+      },
       "actions": {
         "Run_script_on_archived_week": {
           "type": "OpenApiConnection",
           "runAfter": {},
           "inputs": {
-            "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness", "connectionName": "shared_excelonlinebusiness", "operationId": "RunScriptProd" },
+            "host": {
+              "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+              "connectionName": "shared_excelonlinebusiness",
+              "operationId": "RunScriptProd"
+            },
             "parameters": {
-              "source": "@outputs('Settings')?['siteUrl']",
-              "drive": "DOCUMENT_LIBRARY_HOLDING_THE_ARCHIVE",
+              "source": "PICK_LOCATION_IN_DESIGNER",
+              "drive": "PICK_DOCUMENT_LIBRARY_IN_DESIGNER",
               "file": "@items('For_each_archived_week')?['{Identifier}']",
-              "scriptId": "ReconMonitor",
+              "scriptId": "PICK_SCRIPT_ReconMonitor_IN_DESIGNER",
               "ScriptParameters/configJson": "@{base64ToString(body('Get_config')?['$content'])}",
               "ScriptParameters/asOf": "@{convertTimeZone(utcNow(), 'UTC', outputs('Settings')?['timeZone'], 'yyyy-MM-dd')}",
               "ScriptParameters/mode": "extract"
@@ -103,65 +203,112 @@
         },
         "Add_week": {
           "type": "AppendToArrayVariable",
-          "runAfter": { "Run_script_on_archived_week": ["Succeeded"] },
-          "inputs": { "name": "archive", "value": "@body('Run_script_on_archived_week')?['result']?['extractJson']" }
+          "runAfter": {
+            "Run_script_on_archived_week": [
+              "Succeeded"
+            ]
+          },
+          "inputs": {
+            "name": "archive",
+            "value": "@body('Run_script_on_archived_week')?['result']?['extractJson']"
+          }
         }
       }
     },
     "For_each_list": {
       "type": "Foreach",
-      "runAfter": { "For_each_archived_week": ["Succeeded"] },
+      "runAfter": {
+        "For_each_archived_week": [
+          "Succeeded"
+        ]
+      },
       "foreach": "@outputs('Settings')?['lists']",
-      "runtimeConfiguration": { "concurrency": { "repetitions": 1 } },
+      "runtimeConfiguration": {
+        "concurrency": {
+          "repetitions": 1
+        }
+      },
       "actions": {
         "Get_list": {
           "type": "OpenApiConnection",
           "runAfter": {},
           "inputs": {
-            "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline", "connectionName": "shared_sharepointonline", "operationId": "HttpRequest" },
+            "host": {
+              "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+              "connectionName": "shared_sharepointonline",
+              "operationId": "HttpRequest"
+            },
             "parameters": {
               "dataset": "@outputs('Settings')?['siteUrl']",
               "parameters/method": "GET",
               "parameters/uri": "_api/web/lists/getbytitle('@{encodeUriComponent(items('For_each_list'))}')?$select=ListItemEntityTypeFullName",
-              "parameters/headers": { "Accept": "application/json;odata=nometadata" }
+              "parameters/headers": {
+                "Accept": "application/json;odata=nometadata"
+              }
             },
             "authentication": "@parameters('$authentication')"
           }
         },
         "Get_item_ids": {
           "type": "OpenApiConnection",
-          "runAfter": { "Get_list": ["Succeeded"] },
+          "runAfter": {
+            "Get_list": [
+              "Succeeded"
+            ]
+          },
           "inputs": {
-            "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline", "connectionName": "shared_sharepointonline", "operationId": "HttpRequest" },
+            "host": {
+              "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+              "connectionName": "shared_sharepointonline",
+              "operationId": "HttpRequest"
+            },
             "parameters": {
               "dataset": "@outputs('Settings')?['siteUrl']",
               "parameters/method": "GET",
               "parameters/uri": "_api/web/lists/getbytitle('@{encodeUriComponent(items('For_each_list'))}')/items?$select=Id&$top=5000",
-              "parameters/headers": { "Accept": "application/json;odata=nometadata" }
+              "parameters/headers": {
+                "Accept": "application/json;odata=nometadata"
+              }
             },
             "authentication": "@parameters('$authentication')"
           }
         },
         "Add_list": {
           "type": "AppendToArrayVariable",
-          "runAfter": { "Get_item_ids": ["Succeeded"] },
+          "runAfter": {
+            "Get_item_ids": [
+              "Succeeded"
+            ]
+          },
           "inputs": {
             "name": "lists",
-            "value": { "title": "@{items('For_each_list')}", "type": "@{body('Get_list')?['ListItemEntityTypeFullName']}", "items": "@body('Get_item_ids')?['value']" }
+            "value": {
+              "title": "@{items('For_each_list')}",
+              "type": "@{body('Get_list')?['ListItemEntityTypeFullName']}",
+              "items": "@body('Get_item_ids')?['value']"
+            }
           }
         }
       }
     },
     "Run_script": {
       "type": "OpenApiConnection",
-      "runAfter": { "For_each_list": ["Succeeded"] },
+      "runAfter": {
+        "For_each_list": [
+          "Succeeded"
+        ]
+      },
       "inputs": {
-        "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness", "connectionName": "shared_excelonlinebusiness", "operationId": "RunScriptProd" },
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+          "connectionName": "shared_excelonlinebusiness",
+          "operationId": "RunScriptProd"
+        },
         "parameters": {
-          "source": "@outputs('Settings')?['siteUrl']",
-          "drive": "DOCUMENT_LIBRARY_HOLDING_THE_CURRENT_WORKBOOK",
-          "file": "CURRENT_RECONCILIATION_REPORT.xlsx",
-          "scriptId": "ReconMonitor",
+          "source": "PICK_LOCATION_IN_DESIGNER",
+          "drive": "PICK_DOCUMENT_LIBRARY_IN_DESIGNER",
+          "file": "PICK_CURRENT_RECONCILIATION_REPORT_IN_DESIGNER",
+          "scriptId": "PICK_SCRIPT_ReconMonitor_IN_DESIGNER",
           "ScriptParameters/configJson": "@{base64ToString(body('Get_config')?['$content'])}",
           "ScriptParameters/asOf": "@{convertTimeZone(utcNow(), 'UTC', outputs('Settings')?['timeZone'], 'yyyy-MM-dd')}",
           "ScriptParameters/mode": "build",
@@ -173,32 +320,68 @@
     },
     "If_nothing_was_read": {
       "type": "If",
-      "runAfter": { "Run_script": ["Succeeded"] },
-      "expression": { "equals": ["@body('Run_script')?['result']?['ok']", false] },
+      "runAfter": {
+        "Run_script": [
+          "Succeeded"
+        ]
+      },
+      "expression": {
+        "and": [
+          {
+            "equals": [
+              "@body('Run_script')?['result']?['ok']",
+              false
+            ]
+          }
+        ]
+      },
       "actions": {
         "Stop_and_keep_yesterdays_lists": {
           "type": "Terminate",
-          "inputs": { "runStatus": "Failed", "runError": { "code": "NoTrackerRows", "message": "@{join(body('Run_script')?['result']?['warnings'], ' | ')}" } }
+          "inputs": {
+            "runStatus": "Failed",
+            "runError": {
+              "code": "NoTrackerRows",
+              "message": "@{join(body('Run_script')?['result']?['warnings'], ' | ')}"
+            }
+          }
         }
       },
-      "else": { "actions": {} }
+      "else": {
+        "actions": {}
+      }
     },
     "For_each_batch": {
       "type": "Foreach",
-      "runAfter": { "If_nothing_was_read": ["Succeeded"] },
+      "runAfter": {
+        "If_nothing_was_read": [
+          "Succeeded"
+        ]
+      },
       "foreach": "@body('Run_script')?['result']?['spBatches']",
-      "runtimeConfiguration": { "concurrency": { "repetitions": 1 } },
+      "runtimeConfiguration": {
+        "concurrency": {
+          "repetitions": 1
+        }
+      },
       "actions": {
         "Send_batch": {
           "type": "OpenApiConnection",
           "runAfter": {},
           "inputs": {
-            "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline", "connectionName": "shared_sharepointonline", "operationId": "HttpRequest" },
+            "host": {
+              "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+              "connectionName": "shared_sharepointonline",
+              "operationId": "HttpRequest"
+            },
             "parameters": {
               "dataset": "@outputs('Settings')?['siteUrl']",
               "parameters/method": "POST",
               "parameters/uri": "_api/$batch",
-              "parameters/headers": { "Content-Type": "multipart/mixed; boundary=@{items('For_each_batch')?['boundary']}", "Accept": "application/json;odata=verbose" },
+              "parameters/headers": {
+                "Content-Type": "multipart/mixed; boundary=@{items('For_each_batch')?['boundary']}",
+                "Accept": "application/json;odata=verbose"
+              },
               "parameters/body": "@{items('For_each_batch')?['body']}"
             },
             "authentication": "@parameters('$authentication')"
@@ -206,29 +389,65 @@
         },
         "Batch_response": {
           "type": "Compose",
-          "runAfter": { "Send_batch": ["Succeeded"] },
+          "runAfter": {
+            "Send_batch": [
+              "Succeeded"
+            ]
+          },
           "inputs": "@if(empty(body('Send_batch')?['$content']), string(body('Send_batch')), base64ToString(body('Send_batch')?['$content']))"
         },
         "If_any_request_failed": {
           "type": "If",
-          "runAfter": { "Batch_response": ["Succeeded"] },
-          "expression": { "or": [ { "contains": ["@outputs('Batch_response')", "HTTP/1.1 4"] }, { "contains": ["@outputs('Batch_response')", "HTTP/1.1 5"] } ] },
+          "runAfter": {
+            "Batch_response": [
+              "Succeeded"
+            ]
+          },
+          "expression": {
+            "or": [
+              {
+                "contains": [
+                  "@outputs('Batch_response')",
+                  "HTTP/1.1 4"
+                ]
+              },
+              {
+                "contains": [
+                  "@outputs('Batch_response')",
+                  "HTTP/1.1 5"
+                ]
+              }
+            ]
+          },
           "actions": {
             "Remember_error": {
               "type": "AppendToArrayVariable",
               "runAfter": {},
-              "inputs": { "name": "errors", "value": "@{items('For_each_batch')?['label']}: @{take(outputs('Batch_response'), 800)}" }
+              "inputs": {
+                "name": "errors",
+                "value": "@{items('For_each_batch')?['label']}: @{take(outputs('Batch_response'), 800)}"
+              }
             }
           },
-          "else": { "actions": {} }
+          "else": {
+            "actions": {}
+          }
         }
       }
     },
     "Send_daily_summary": {
       "type": "OpenApiConnection",
-      "runAfter": { "For_each_batch": ["Succeeded"] },
+      "runAfter": {
+        "For_each_batch": [
+          "Succeeded"
+        ]
+      },
       "inputs": {
-        "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_office365", "connectionName": "shared_office365", "operationId": "SendEmailV2" },
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_office365",
+          "connectionName": "shared_office365",
+          "operationId": "SendEmailV2"
+        },
         "parameters": {
           "emailMessage/To": "@outputs('Settings')?['mailTo']",
           "emailMessage/Subject": "@body('Run_script')?['result']?['subject']",
@@ -240,15 +459,38 @@
     },
     "If_list_updates_failed": {
       "type": "If",
-      "runAfter": { "Send_daily_summary": ["Succeeded"] },
-      "expression": { "not": { "equals": ["@length(variables('errors'))", 0] } },
+      "runAfter": {
+        "Send_daily_summary": [
+          "Succeeded"
+        ]
+      },
+      "expression": {
+        "and": [
+          {
+            "not": {
+              "equals": [
+                "@length(variables('errors'))",
+                0
+              ]
+            }
+          }
+        ]
+      },
       "actions": {
         "Mark_run_failed": {
           "type": "Terminate",
-          "inputs": { "runStatus": "Failed", "runError": { "code": "ListUpdateFailed", "message": "@{join(variables('errors'), ' || ')}" } }
+          "inputs": {
+            "runStatus": "Failed",
+            "runError": {
+              "code": "ListUpdateFailed",
+              "message": "@{join(variables('errors'), ' || ')}"
+            }
+          }
         }
       },
-      "else": { "actions": {} }
+      "else": {
+        "actions": {}
+      }
     }
   },
   "outputs": {}

@@ -40,6 +40,31 @@ against the original dashboard (`tests/sharepoint-lists.mjs`: 602 rows and figur
 2. Open the current Reconciliation Report in Excel for the web → **Automate → New script** → paste
    `ReconMonitor.ts` → name it **ReconMonitor** → Save.
 
+## Quickest: import the two flows
+
+`flow/packages/Recon-Setup-Lists.zip` and `flow/packages/Recon-Daily-Refresh.zip` contain the flows of
+steps 2 and 3 below, ready to import (rebuild them with `python3 flow/make-packages.py` after changing the
+definitions).
+
+For each package: **make.powerautomate.com → My flows → Import → Import Package (Legacy)** → upload the zip →
+under *Related resources* click **Select during import** for each connection (SharePoint, Excel Online
+(Business), Office 365 Outlook) and pick yours → **Import**. Then open the flow → **Edit** and set what is
+specific to your tenant:
+
+| Flow | Step | Set |
+|---|---|---|
+| both | `Settings` | `siteUrl`, `configPath` (and in the daily flow `archiveFolder`, `pageUrl`, `timeZone`, `mailTo`) |
+| setup | `Run_script_setup` | **Location** (your site), **Document Library**, **File** = the current Reconciliation Report, **Script** = `ReconMonitor` |
+| daily | `Get_archived_weeks` | **Library Name** = the library holding the archive folder |
+| daily | `Run_script_on_archived_week` (inside the first loop) | **Location**, **Document Library** (of the archive), **Script** = `ReconMonitor`; leave **File** as the expression `items('For_each_archived_week')?['{Identifier}']` |
+| daily | `Run_script` | **Location**, **Document Library**, **File** = the current Reconciliation Report, **Script** = `ReconMonitor` |
+
+After picking the script, check its input boxes still hold the expressions (re-selecting a script can clear
+them); re-enter any that are empty from the tables in steps 2 and 3. Save. The setup flow is run by hand; the
+daily flow runs on its schedule (07:15 Eastern by default, change it in the trigger).
+
+If the import itself is refused, build the flows by hand from the tables below — the result is the same.
+
 ## 2. Setup flow (run once)
 
 Create an **Instant cloud flow** (*Manually trigger a flow*) with these steps; names matter for the expressions.
