@@ -1,5 +1,10 @@
 # Reconciliation Monitor on Power Automate
 
+> **Live in SharePoint without custom script: see [SHAREPOINT-LISTS.md](SHAREPOINT-LISTS.md).** A daily flow fills
+> six SharePoint lists and four modern pages show them, with the customer drill-down. That is the route to use
+> when the site does not allow custom script. The rest of this file covers the shared Office Script, its
+> configuration, and two other delivery options (a page with its own script, an HTML file by e-mail).
+
 Rebuilds the Reconciliation Monitor dashboard automatically. A scheduled cloud flow reads the archived
 weekly workbooks and the current Reconciliation Report, applies the dashboard's rules, saves the finished
 dashboard as an `.html` file in SharePoint and e-mails a daily summary with the dashboard attached.
@@ -39,7 +44,8 @@ There are two ways to run it; both use the same rules code and the same configur
 | `office-scripts/ReconMonitor.ts` | The logic: read tracker, align names, classify feeds, KPIs, highlights, anomalies, history, e-mail body |
 | `dashboard/recon-monitor.template.html` | The dashboard page without data (`"__RECON_DATA__"` placeholder) |
 | `config/recon-config.sample.json` | Settings: sheet/column mapping, customer name alignment, thresholds |
-| `flow/definition.json` | Reference definition of the flow (trigger, actions, expressions) |
+| `flow/setup-lists.json`, `flow/daily-refresh.json` | SharePoint-lists route: one-off setup flow and daily refresh flow (reference definitions) |
+| `SHAREPOINT-LISTS.md` | SharePoint-lists route: lists, flows, pages, drill-down |
 | `tests/` | Synthetic tests and a parity check against a hand-built dashboard |
 
 ## What the script decides
@@ -167,8 +173,8 @@ sheet, header row and columns matched, and adjust `recon-config.json` if a sheet
 
 ### 4. Build the flow
 
-Create a **Scheduled cloud flow** and add the steps below. `flow/definition.json` holds the same flow as
-code (open any step and choose *Peek code* to compare). Name the steps exactly as in the first column so
+Create a **Scheduled cloud flow** and add the steps below (this is the HTML-file variant; the SharePoint-lists
+flow in `flow/daily-refresh.json` shares steps 1–8a, see SHAREPOINT-LISTS.md). Name the steps exactly as in the first column so
 the expressions work as written.
 
 | # | Step name | Action | Settings |
@@ -245,6 +251,7 @@ not-reported list and volume anomalies; plus the `history` block.
 ```bash
 node tests/run-tests.mjs                                   # synthetic data
 node tests/parity.mjs "<existing Reconciliation-Monitor.html>"   # compare with a hand-built dashboard
+node tests/sharepoint-lists.mjs "<existing Reconciliation-Monitor.html>"   # SharePoint lists: setup + 2 daily runs on a strict mock SharePoint, rows vs original
 tsc --noEmit --strict --target ES2019 --lib ES2019 office-scripts/ReconMonitor.ts tests/excelscript.d.ts
 ```
 

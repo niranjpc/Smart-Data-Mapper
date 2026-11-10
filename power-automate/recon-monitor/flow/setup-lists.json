@@ -1,0 +1,106 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "name": "Reconciliation Monitor – one-off setup of the SharePoint lists",
+    "note": "Run once. Creates the six Recon lists with their columns, views and formatting on the site in recon-config.json (siteUrl). Values in CAPITALS are picked in the designer."
+  },
+  "parameters": {
+    "$connections": { "defaultValue": {}, "type": "Object" },
+    "$authentication": { "defaultValue": {}, "type": "SecureObject" }
+  },
+  "triggers": {
+    "manual": { "type": "Request", "kind": "Button", "inputs": { "schema": { "type": "object", "properties": {}, "required": [] } } }
+  },
+  "actions": {
+    "Settings": {
+      "type": "Compose",
+      "runAfter": {},
+      "inputs": { "siteUrl": "https://TENANT.sharepoint.com/sites/TechOps", "configPath": "/Shared Documents/Recon/Monitor/recon-config.json" }
+    },
+    "Get_config": {
+      "type": "OpenApiConnection",
+      "runAfter": { "Settings": ["Succeeded"] },
+      "inputs": {
+        "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline", "connectionName": "shared_sharepointonline", "operationId": "GetFileContentByPath" },
+        "parameters": { "dataset": "@outputs('Settings')?['siteUrl']", "path": "@outputs('Settings')?['configPath']", "inferContentType": false },
+        "authentication": "@parameters('$authentication')"
+      }
+    },
+    "Initialize_errors": {
+      "type": "InitializeVariable",
+      "runAfter": { "Get_config": ["Succeeded"] },
+      "inputs": { "variables": [{ "name": "errors", "type": "array", "value": [] }] }
+    },
+    "Run_script_setup": {
+      "type": "OpenApiConnection",
+      "runAfter": { "Initialize_errors": ["Succeeded"] },
+      "inputs": {
+        "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness", "connectionName": "shared_excelonlinebusiness", "operationId": "RunScriptProd" },
+        "parameters": {
+          "source": "@outputs('Settings')?['siteUrl']",
+          "drive": "DOCUMENT_LIBRARY_HOLDING_THE_CURRENT_WORKBOOK",
+          "file": "CURRENT_RECONCILIATION_REPORT.xlsx",
+          "scriptId": "ReconMonitor",
+          "ScriptParameters/configJson": "@{base64ToString(body('Get_config')?['$content'])}",
+          "ScriptParameters/mode": "setup"
+        },
+        "authentication": "@parameters('$authentication')"
+      }
+    },
+    "For_each_batch": {
+      "type": "Foreach",
+      "runAfter": { "Run_script_setup": ["Succeeded"] },
+      "foreach": "@body('Run_script_setup')?['result']?['spBatches']",
+      "runtimeConfiguration": { "concurrency": { "repetitions": 1 } },
+      "actions": {
+        "Send_batch": {
+          "type": "OpenApiConnection",
+          "runAfter": {},
+          "inputs": {
+            "host": { "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline", "connectionName": "shared_sharepointonline", "operationId": "HttpRequest" },
+            "parameters": {
+              "dataset": "@outputs('Settings')?['siteUrl']",
+              "parameters/method": "POST",
+              "parameters/uri": "_api/$batch",
+              "parameters/headers": { "Content-Type": "multipart/mixed; boundary=@{items('For_each_batch')?['boundary']}", "Accept": "application/json;odata=verbose" },
+              "parameters/body": "@{items('For_each_batch')?['body']}"
+            },
+            "authentication": "@parameters('$authentication')"
+          }
+        },
+        "Batch_response": {
+          "type": "Compose",
+          "runAfter": { "Send_batch": ["Succeeded"] },
+          "inputs": "@if(empty(body('Send_batch')?['$content']), string(body('Send_batch')), base64ToString(body('Send_batch')?['$content']))"
+        },
+        "If_any_request_failed": {
+          "type": "If",
+          "runAfter": { "Batch_response": ["Succeeded"] },
+          "expression": { "or": [ { "contains": ["@outputs('Batch_response')", "HTTP/1.1 4"] }, { "contains": ["@outputs('Batch_response')", "HTTP/1.1 5"] } ] },
+          "actions": {
+            "Remember_error": {
+              "type": "AppendToArrayVariable",
+              "runAfter": {},
+              "inputs": { "name": "errors", "value": "@{items('For_each_batch')?['label']}: @{take(outputs('Batch_response'), 800)}" }
+            }
+          },
+          "else": { "actions": {} }
+        }
+      }
+    },
+    "If_setup_failed": {
+      "type": "If",
+      "runAfter": { "For_each_batch": ["Succeeded"] },
+      "expression": { "not": { "equals": ["@length(variables('errors'))", 0] } },
+      "actions": {
+        "Mark_run_failed": {
+          "type": "Terminate",
+          "inputs": { "runStatus": "Failed", "runError": { "code": "SetupFailed", "message": "@{join(variables('errors'), ' || ')}" } }
+        }
+      },
+      "else": { "actions": {} }
+    }
+  },
+  "outputs": {}
+}

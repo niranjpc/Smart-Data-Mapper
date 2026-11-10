@@ -14,6 +14,9 @@
  *                "extract" (reads this workbook only and returns its rows in extractJson — run on each archived week)
  *   archiveJson: JSON array of the extractJson outputs of the archived weeks, oldest first ("" = none).
  *                Rows of this workbook replace archived rows for the same customer, interface and day.
+ *   sharepointJson: for the SharePoint-lists dashboard: JSON array [{ title, type, items: [{ Id }] }] — each list's
+ *                item entity type and current item ids. The result then carries spBatches: $batch requests that
+ *                replace the lists' contents. With mode "setup", spBatches create the lists, columns and views.
  */
 
 type Cell = string | number | boolean;
@@ -30,7 +33,7 @@ interface InterfaceCfg {
 }
 interface Segment { hr: number; end: number; titles: string[]; accCol: number }
 interface ReconConfig {
-  startDate?: string; homeUrl?: string; dashboardUrl?: string; dateOrder?: string;
+  startDate?: string; homeUrl?: string; dashboardUrl?: string; dateOrder?: string; siteUrl?: string; spBatchSize?: number;
   minRowsForDefaultDay?: number; scheduleSheet?: string; scheduleIgnoreTypes?: string[];
   accountAliases?: { [raw: string]: string }; ignoreAccounts?: string[]; unmappedAccounts?: string;
   explainedCommentPattern?: string; varianceWhenMissing?: string;
@@ -51,7 +54,7 @@ interface ReconResult {
   dataJson: string; digestJson: string;
   daily: Tiles; weekly: Tiles; monthly: Tiles;
   dailyLabel: string; weeklyLabel: string; monthlyLabel: string;
-  needsAttention: boolean; subject: string; emailHtml: string; warnings: string[]; extractJson: string;
+  needsAttention: boolean; subject: string; emailHtml: string; warnings: string[]; extractJson: string; spBatches: SpBatch[];
 }
 
 interface Bucket {
@@ -114,9 +117,21 @@ const DEFAULT_INTERFACES: InterfaceCfg[] = [
   {"name": "Encounter Rejections", "sheet": "Encounter Submission", "block": "Rejections", "columns": {"date": ["^to date$"], "received": ["^extracted"], "loaded": ["^loaded"], "error": ["^rejected"]}}
 ];
 
-function main(workbook: ExcelScript.Workbook, configJson: string = "", asOf: string = "", mode: string = "build", archiveJson: string = ""): ReconResult {
+function main(workbook: ExcelScript.Workbook, configJson: string = "", asOf: string = "", mode: string = "build", archiveJson: string = "",
+  sharepointJson: string = ""): ReconResult {
   const warnings: string[] = [];
   const cfg: ReconConfig = configJson && configJson.trim() ? JSON.parse(configJson) : {};
+  const none: Tiles = { inScope: 0, fullyReconciled: 0, notFullyReconciled: 0, trackedViaTicket: 0, notTrackedViaTicket: 0, notReported: 0, varianceSum: 0, reconciledRate: -1 };
+  const empty = (ok: boolean, w: string[], extractJson: string, spBatches: SpBatch[]): ReconResult => ({
+    ok, asOf: "", defaultDay: "", generated: new Date().toISOString(), dataJson: "", digestJson: "",
+    daily: none, weekly: none, monthly: none, dailyLabel: "", weeklyLabel: "", monthlyLabel: "",
+    needsAttention: false, subject: "", emailHtml: "", warnings: w, extractJson, spBatches
+  });
+  // one-off: create the SharePoint lists, columns, views and formatting
+  if (mode.toLowerCase() === "setup") {
+    if (!cfg.siteUrl) return empty(false, ["recon-config.json needs siteUrl (the site that will hold the lists)."], "", []);
+    return empty(true, [], "", spSetup(cfg.siteUrl, cfg.spBatchSize || 100));
+  }
   const interfaces: InterfaceCfg[] = cfg.interfaces && cfg.interfaces.length ? cfg.interfaces : DEFAULT_INTERFACES;
   const ifs = interfaces.map(x => x.name);
   const typ = interfaces.map(x => x.scheduleType ? x.scheduleType
@@ -308,12 +323,7 @@ function main(workbook: ExcelScript.Workbook, configJson: string = "", asOf: str
     const ex: WeekRows = { start: new Date(T0 * MS_DAY).toISOString().slice(0, 10), acc, ifs, f: [], x: [] };
     facts.forEach(r => ex.f.push(r.slice()));
     X.forEach(k => ex.x.push([k % KEY, Math.floor(Math.floor(k / KEY) / NI), Math.floor(k / KEY) % NI]));
-    const none: Tiles = { inScope: 0, fullyReconciled: 0, notFullyReconciled: 0, trackedViaTicket: 0, notTrackedViaTicket: 0, notReported: 0, varianceSum: 0, reconciledRate: -1 };
-    return {
-      ok: maxDay >= 0, asOf: "", defaultDay: "", generated: new Date().toISOString(), dataJson: "", digestJson: "",
-      daily: none, weekly: none, monthly: none, dailyLabel: "", weeklyLabel: "", monthlyLabel: "",
-      needsAttention: false, subject: "", emailHtml: "", warnings, extractJson: JSON.stringify(ex)
-    };
+    return empty(maxDay >= 0, warnings, JSON.stringify(ex), []);
   }
   const LAST = Math.max(0, asOfDay === null ? maxDay : Math.min(maxDay, cap));
   const NA = acc.length;
@@ -354,16 +364,32 @@ function main(workbook: ExcelScript.Workbook, configJson: string = "", asOf: str
     monthly: section(model, monthlyLabel, mFrom, mTo, oM, hM),
     history: history(model)
   };
+  // ---- SharePoint lists: rows for every list, as $batch requests that replace the lists' contents ----
+  let spBatches: SpBatch[] = [];
+  const spMode = !!(sharepointJson && sharepointJson.trim());
+  if (spMode) {
+    if (!cfg.siteUrl) warnings.push("recon-config.json needs siteUrl to write the SharePoint lists.");
+    else {
+      const info: SpListInfo[] = JSON.parse(sharepointJson);
+      const periods: SpPeriod[] = [
+        { name: SP_PERIODS[0], v: "d", d1: DEF, d2: DEF, label: dailyLabel },
+        { name: SP_PERIODS[1], v: "w", d1: wk, d2: wTo, label: weeklyLabel },
+        { name: SP_PERIODS[2], v: "m", d1: mFrom, d2: mTo, label: monthlyLabel }];
+      const rows = spData(model, months, mo, periods, "Data loaded through " + md(model, LAST) + " · refreshed " + generated.slice(0, 16).replace("T", " ") + " UTC");
+      spBatches = spDaily(cfg.siteUrl, info, rows, spWeekTitles(model), cfg.spBatchSize || 100, warnings);
+    }
+  }
   const needsAttention = oD.attN > 0 || oD.miss > 0;
   const subject = "Reconciliation Monitor · " + DOW[DEF % 7] + " " + md(model, DEF) + " · " + (oD.rate === null ? "no feeds reported" : oD.rate + "% reconciled") +
     (oD.attN ? " · " + oD.attN + " without ticket" : "") + (oD.miss ? " · " + oD.miss + " not reported" : "");
 
   return {
     ok: maxDay >= 0, asOf: data.asOf, defaultDay: iso(model, DEF), generated,
-    dataJson, digestJson: JSON.stringify(digest),
+    // the SharePoint-lists flow does not need the page dataset or the digest; leaving them out keeps the output small
+    dataJson: spMode ? "" : dataJson, digestJson: spMode ? "" : JSON.stringify(digest),
     daily: tiles(oD), weekly: tiles(oW), monthly: tiles(oM),
     dailyLabel, weeklyLabel, monthlyLabel, needsAttention, subject,
-    emailHtml: emailHtml(model, dailyLabel, oD, hD, weeklyLabel, oW, cfg.dashboardUrl || ""), warnings, extractJson: ""
+    emailHtml: emailHtml(model, dailyLabel, oD, hD, weeklyLabel, oW, cfg.dashboardUrl || ""), warnings, extractJson: "", spBatches
   };
 }
 
@@ -739,6 +765,23 @@ function section(M: Model, label: string, d1: number, d2: number, o: Scan, hl: s
   };
 }
 
+/** Feeds not fully reconciled again and again: weeks affected, days, longest run of consecutive days, ticketed. */
+function recurring(M: Model): Rec[] {
+  const pr = new Map<string, Rec>();
+  for (let d = 0; d <= M.LAST; d++) for (let a = 0; a < M.NA; a++) for (let i = 0; i < M.NI; i++) {
+    const c = cell(M, a, i, d);
+    if (!c || c.s !== "att") continue;
+    const k = a + "|" + i;
+    let p = pr.get(k);
+    if (!p) { p = { a, i, wk: new Set<number>(), n: 0, sum: 0, t: 0, last: 0, str: 0, cur: 0, prev: -9 }; pr.set(k, p); }
+    p.wk.add(Math.floor(d / 7)); p.n++; p.sum += c.v; if (c.t) p.t++;
+    p.last = d; p.cur = d - p.prev <= 1 ? p.cur + 1 : 1; p.str = Math.max(p.str, p.cur); p.prev = d;
+  }
+  const recs: Rec[] = []; pr.forEach(p => recs.push(p));
+  recs.sort((p, q) => q.wk.size - p.wk.size || q.sum - p.sum);
+  return recs;
+}
+
 /** Historical view: weekly scorecard per customer, recurring issues, quality over time. */
 function history(M: Model) {
   const weeks: number[] = [];
@@ -755,23 +798,11 @@ function history(M: Model) {
     rs.slice(-8, -4).forEach(v => { if (v !== null) old.push(v); });
     scorecard.push({ customer: n, rates: rs, last4VsPrior4: rec.length && old.length ? Math.round(avg(rec) - avg(old)) : null });
   });
-  const pr = new Map<string, Rec>();
-  for (let d = 0; d <= M.LAST; d++) for (let a = 0; a < M.NA; a++) for (let i = 0; i < M.NI; i++) {
-    const c = cell(M, a, i, d);
-    if (!c || c.s !== "att") continue;
-    const k = a + "|" + i;
-    let p = pr.get(k);
-    if (!p) { p = { a, i, wk: new Set<number>(), n: 0, sum: 0, t: 0, last: 0, str: 0, cur: 0, prev: -9 }; pr.set(k, p); }
-    p.wk.add(Math.floor(d / 7)); p.n++; p.sum += c.v; if (c.t) p.t++;
-    p.last = d; p.cur = d - p.prev <= 1 ? p.cur + 1 : 1; p.str = Math.max(p.str, p.cur); p.prev = d;
-  }
-  const recs: Rec[] = []; pr.forEach(p => recs.push(p));
-  recs.sort((p, q) => q.wk.size - p.wk.size || q.sum - p.sum);
   const W = weeks.map(w => scan(M, w, wEnd(w), -1, -1, true));
   return {
     weeks: weeks.map(w => iso(M, w)),
     scorecard,
-    recurringIssues: recs.slice(0, 12).map(p => ({ customer: M.acc[p.a], interface: M.ifs[p.i], weeksAffected: p.wk.size, days: p.n, longestRunDays: p.str, varianceSum: p.sum, ticketedPct: Math.round(100 * p.t / p.n), lastSeen: iso(M, p.last) })),
+    recurringIssues: recurring(M).slice(0, 12).map(p => ({ customer: M.acc[p.a], interface: M.ifs[p.i], weeksAffected: p.wk.size, days: p.n, longestRunDays: p.str, varianceSum: p.sum, ticketedPct: Math.round(100 * p.t / p.n), lastSeen: iso(M, p.last) })),
     quality: W.map((x, k) => {
       const t = x.g + x.att + x.miss;
       return { week: iso(M, weeks[k]), reconciledRate: pct(x.g, x.att), ticketCoverage: x.att ? Math.round(100 * x.attT / x.att) : null, scheduleAdherence: t ? Math.round(100 * (1 - x.miss / t)) : null };
@@ -797,4 +828,328 @@ function emailHtml(M: Model, dLabel: string, oD: Scan, hD: string[], wLabel: str
   h += "<div style=\"font-weight:600;margin:14px 0 0\">" + esc(wLabel) + "</div>" + row(oW);
   if (url) h += "<p><a href=\"" + esc(url) + "\" style=\"color:#1fb5ad;font-weight:600\">Open the Reconciliation Monitor</a></p>";
   return h + "<div style=\"color:#5b6578;font-size:12px\">Data loaded through " + md(M, M.LAST) + " · generated by Power Automate.</div></div>";
+}
+
+/* ======================= SharePoint lists dashboard =======================
+ * Six lists hold the dashboard; a modern SharePoint page shows them with List web parts. Selecting a customer in the
+ * "Customers" web part filters the other web parts (SharePoint dynamic filtering) — the drill-down. Formatting uses
+ * SharePoint's JSON view / column formatting, which needs no custom script.
+ */
+
+type SpValue = string | number | null;
+interface SpRow { [field: string]: SpValue }
+interface SpField { n: string; t: string; d: string }   // internal name, type (Text | Number | Note), display name
+interface SpList { key: string; title: string; titleName: string; desc: string; fields: SpField[] }
+interface SpView { list: string; title: string; query: string; rowLimit: number; paged: boolean; fields: string[]; formatter: string }
+interface SpListInfo { title: string; type: string; items: { Id: number }[] }
+interface SpBatch { boundary: string; body: string; operations: number; label: string }
+interface SpPeriod { name: string; v: string; d1: number; d2: number; label: string }
+
+const SP_PERIODS = ["Latest day", "This week", "This month"];
+const SP_ALL = "(All customers)";
+const SP_WEEKS = 12;
+const SP_CAP_VARIANCES = 250, SP_CAP_NOT_REPORTED = 300, SP_CAP_ANOMALIES = 50, SP_CAP_RECURRING = 100, SP_TREND_DAYS = 28;
+
+function spLists(): SpList[] {
+  const num = (n: string, d: string): SpField => ({ n, t: "Number", d });
+  const txt = (n: string, d: string): SpField => ({ n, t: "Text", d });
+  const counts: SpField[] = [num("InScope", "In scope"), num("Reconciled", "Fully reconciled"), num("NotReconciled", "Not fully reconciled"),
+    num("Ticketed", "Tracked via ticket"), num("NotTicketed", "Not tracked via ticket"), num("NotReported", "Not reported"), num("VarianceSum", "Variance Σ|v|")];
+  const weeks: SpField[] = [];
+  for (let k = 1; k <= SP_WEEKS; k++) weeks.push(num(spWeekField(k), "Week " + k));
+  return [
+    { key: "summary", title: "Recon Summary", titleName: "Customer", desc: "Reconciliation Monitor: tiles and highlights per period and customer (refreshed by Power Automate).",
+      fields: [txt("Period", "Period"), txt("Covers", "Covers"), num("SortKey", "Sort"), txt("Status", "Status")].concat(counts,
+        [num("Rate", "Reconciled rate"), { n: "Highlights", t: "Note", d: "Highlights" }, txt("DataThrough", "Data through")]) },
+    { key: "interfaces", title: "Recon Interfaces", titleName: "Interface", desc: "Reconciliation Monitor: interface summary per period and customer.",
+      fields: [txt("Customer", "Customer"), txt("Period", "Period"), txt("Status", "Status"), num("Received", "Received"), num("Loaded", "Loaded"),
+        num("Errors", "Error"), num("Pending", "Pending / WB")].concat(counts) },
+    { key: "issues", title: "Recon Issues", titleName: "Interface", desc: "Reconciliation Monitor: variances, feeds not reported and volume anomalies.",
+      fields: [txt("Customer", "Customer"), txt("Period", "Period"), txt("IssueType", "Type"), txt("Day", "Day"), txt("DayDate", "Date"),
+        num("Amount", "Value"), num("Usual", "Usual"), num("ChangePct", "Change %"), txt("Ticket", "Ticket"), num("SortKey", "Sort")] },
+    { key: "trend", title: "Recon Daily Trend", titleName: "Customer", desc: "Reconciliation Monitor: reconciled rate per day, last " + SP_TREND_DAYS + " days.",
+      fields: [txt("Day", "Day"), txt("DayDate", "Date"), num("Rate", "Reconciled rate"), num("NotReconciled", "Not fully reconciled"),
+        num("NotReported", "Not reported"), num("InScope", "In scope")] },
+    { key: "scorecard", title: "Recon Weekly Scorecard", titleName: "Customer", desc: "Reconciliation Monitor: reconciled rate by week (column titles are the week start dates).",
+      fields: [num("SortKey", "Sort")].concat(weeks, [num("Change", "Last 4 vs prior 4")]) },
+    { key: "recurring", title: "Recon Recurring Issues", titleName: "Interface", desc: "Reconciliation Monitor: feeds that keep coming back.",
+      fields: [txt("Customer", "Customer"), num("WeeksAffected", "Weeks affected"), num("Days", "Days"), num("LongestRun", "Longest run (days)"),
+        num("VarianceSum", "Variance Σ|v|"), num("TicketedPct", "Ticketed %"), txt("LastSeen", "Last seen"), num("SortKey", "Sort")] }
+  ];
+}
+function spWeekField(k: number): string { return "W" + (k < 10 ? "0" : "") + k; }
+
+/* ---------- formatting (SharePoint JSON formatting) ---------- */
+
+const SP_ROW_SCHEMA = "https://developer.microsoft.com/json-schemas/sp/v2/row-formatting.schema.json";
+const SP_COL_SCHEMA = "https://developer.microsoft.com/json-schemas/sp/v2/column-formatting.schema.json";
+
+/** KPI card: the five dashboard tiles + highlights, for the one row the view shows. */
+function spKpiFormatter(): string {
+  const tile = (label: string, value: string, color: string, sub: string) => ({
+    elmType: "div",
+    style: { "flex": "1 1 150px", "min-width": "140px", "margin": "4px", "padding": "10px 12px", "border": "1px solid #e1e7ee",
+      "border-top": "3px solid " + color, "border-radius": "12px", "background-color": "#ffffff", "text-align": "center" },
+    children: [
+      { elmType: "div", txtContent: label, style: { "font-size": "11px", "font-weight": "600", "text-transform": "uppercase", "letter-spacing": "0.06em", "color": "#5b6578" } },
+      { elmType: "div", txtContent: value, style: { "font-size": "30px", "font-weight": "600", "line-height": "1.2", "color": color } },
+      { elmType: "div", txtContent: sub, style: { "font-size": "12px", "color": "#5b6578" } }]
+  });
+  const f = {
+    $schema: SP_ROW_SCHEMA, hideSelection: true, hideColumnHeader: true,
+    rowFormatter: {
+      elmType: "div", style: { "display": "block", "width": "100%", "padding": "4px 0" },
+      children: [
+        { elmType: "div", style: { "background-color": "#161d3f", "color": "#ffffff", "border-radius": "12px", "padding": "14px 18px", "margin": "4px" },
+          children: [
+            { elmType: "div", txtContent: "=if([$Title] == '" + SP_ALL + "', 'TECHNOLOGY OPERATIONS · PORTFOLIO', 'TECHNOLOGY OPERATIONS · CUSTOMER') + ' · RECONCILIATION REPORT'",
+              style: { "font-size": "11px", "font-weight": "600", "letter-spacing": "0.12em", "color": "#6fd9d4" } },
+            { elmType: "div", txtContent: "=if([$Title] == '" + SP_ALL + "', 'All customers · Portfolio', [$Title] + ' · Reconciliation')",
+              style: { "font-size": "24px", "font-weight": "600" } },
+            { elmType: "div", txtContent: "=[$Covers] + ' · ' + [$DataThrough]", style: { "font-size": "13px", "color": "#c9d0e6" } }] },
+        { elmType: "div", style: { "display": "flex", "flex-wrap": "wrap" },
+          children: [
+            tile("In scope", "=toLocaleString([$InScope])", "#161d3f", "Feeds scheduled"),
+            tile("Fully reconciled", "=toLocaleString([$Reconciled])", "#1e9e6a", "No variance"),
+            tile("Not fully reconciled", "=toLocaleString([$NotReconciled])", "#c77700",
+              "='Tracked ' + toLocaleString([$Ticketed]) + ' · not tracked ' + toLocaleString([$NotTicketed]) + ' · Σ|v| ' + toLocaleString([$VarianceSum])"),
+            tile("Scheduled but not reported", "=toLocaleString([$NotReported])", "#c73a3a", "Expected, no row"),
+            tile("Reconciled rate", "=if([$Rate] == '', '–', toString([$Rate]) + '%')", "#1e9e6a", "Of feeds reported")] },
+        { elmType: "div", style: { "margin": "4px", "padding": "10px 14px", "border": "1px solid #e1e7ee", "border-left": "4px solid #1fb5ad",
+            "border-radius": "12px", "background-color": "#f6f8fb", "display": "=if([$Highlights] == '', 'none', 'block')" },
+          children: [
+            { elmType: "div", txtContent: "Highlights", style: { "font-size": "14px", "font-weight": "700", "margin-bottom": "4px" } },
+            { elmType: "div", txtContent: "[$Highlights]", style: { "white-space": "pre-wrap", "font-size": "13px", "line-height": "1.5" } }] }]
+    }
+  };
+  return JSON.stringify(f);
+}
+
+/** Row colours by status, as on the dashboard (amber = variance without ticket, red = not reported, green = reconciled). */
+function spStatusRows(): string {
+  return JSON.stringify({ $schema: SP_ROW_SCHEMA,
+    additionalRowClass: "=if([$Status] == 'Variance without ticket', 'sp-field-severity--severeWarning', if([$Status] == 'Variance with ticket', 'sp-field-severity--warning', if([$Status] == 'Not reported', 'sp-field-severity--blocked', if([$Status] == 'Reconciled', 'sp-field-severity--good', ''))))" });
+}
+function spTicketRows(): string {
+  return JSON.stringify({ $schema: SP_ROW_SCHEMA,
+    additionalRowClass: "=if([$Ticket] == 'Not tracked', 'sp-field-severity--severeWarning', if([$Ticket] == 'Tracked', 'sp-field-severity--low', 'sp-field-severity--blocked'))" });
+}
+function spPercent(): string {
+  return JSON.stringify({ $schema: SP_COL_SCHEMA, elmType: "div", txtContent: "=if(@currentField == '', '–', toString(@currentField) + '%')" });
+}
+function spRateBar(): string {
+  return JSON.stringify({ $schema: SP_COL_SCHEMA, elmType: "div", style: { "display": "flex", "align-items": "center", "width": "100%" },
+    children: [
+      { elmType: "div", style: { "height": "12px", "border-radius": "3px", "margin-right": "6px",
+        "background-color": "=if(@currentField >= 95, '#8cc0a8', if(@currentField >= 85, '#b9d49a', if(@currentField >= 70, '#e3a977', '#dc9a9a')))",
+        "width": "=if(@currentField == '', '0px', toString(@currentField) + 'px')" } },
+      { elmType: "span", txtContent: "=if(@currentField == '', '–', toString(@currentField) + '%')" }] });
+}
+function spHeat(): string {
+  return JSON.stringify({ $schema: SP_COL_SCHEMA, elmType: "div", txtContent: "=if(@currentField == '', '·', toString(@currentField))",
+    style: { "width": "100%", "text-align": "center", "padding": "2px 0",
+      "background-color": "=if(@currentField == '', '#f3f5f8', if(@currentField >= 95, '#d3eadd', if(@currentField >= 85, '#e6efd9', if(@currentField >= 70, '#f8ebc9', '#f2d4cf'))))" } });
+}
+function spChange(): string {
+  return JSON.stringify({ $schema: SP_COL_SCHEMA, elmType: "div",
+    txtContent: "=if(@currentField == '', '–', if(@currentField > 0, '▲ +' + toString(@currentField), if(@currentField < 0, '▼ ' + toString(@currentField), '● 0')))",
+    style: { "font-weight": "600", "color": "=if(@currentField > 0, '#1e9e6a', if(@currentField < 0, '#c73a3a', '#5b6578'))" } });
+}
+
+/** Views (one set per period) and the column formatters, by list key. */
+function spViews(): SpView[] {
+  const x = (v: string): string => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/'/g, "&apos;");
+  const eq = (f: string, v: string): string => "<Eq><FieldRef Name='" + f + "'/><Value Type='Text'>" + x(v) + "</Value></Eq>";
+  const and = (a: string, b: string): string => "<And>" + a + b + "</And>";
+  const where = (c: string): string => "<Where>" + c + "</Where>";
+  const order = (...f: string[]): string => "<OrderBy>" + f.map(s => "<FieldRef Name='" + s.replace(/ desc$/, "") + "' Ascending='" + (/ desc$/.test(s) ? "FALSE" : "TRUE") + "'/>").join("") + "</OrderBy>";
+  const group = (f: string): string => "<GroupBy Collapse='TRUE' GroupLimit='100'><FieldRef Name='" + f + "'/></GroupBy>";
+  const counts = ["InScope", "Reconciled", "NotReconciled", "Ticketed", "NotTicketed", "NotReported", "VarianceSum"];
+  const v: SpView[] = [];
+  SP_PERIODS.forEach(P => {
+    v.push({ list: "summary", title: P + " KPI", query: where(eq("Period", P)) + order("SortKey"), rowLimit: 1, paged: false,
+      fields: ["Title", "Covers", "DataThrough", "Highlights", "Rate"].concat(counts), formatter: spKpiFormatter() });
+    v.push({ list: "summary", title: P + " Customers", query: where(and(eq("Period", P), "<Gt><FieldRef Name='SortKey'/><Value Type='Number'>0</Value></Gt>")) + order("SortKey"),
+      rowLimit: 100, paged: true, fields: ["Title"].concat(counts, ["Rate", "Status"]), formatter: spStatusRows() });
+    v.push({ list: "interfaces", title: P + " Interfaces", query: group("Customer") + where(eq("Period", P)) + order("Customer", "VarianceSum desc", "NotReported desc"),
+      rowLimit: 100, paged: true, fields: ["Title", "InScope", "Received", "Loaded", "Errors", "Pending", "VarianceSum", "Reconciled", "Ticketed", "NotTicketed", "NotReported", "Status"], formatter: spStatusRows() });
+    v.push({ list: "issues", title: P + " Variances", query: where(and(eq("Period", P), eq("IssueType", "Variance"))) + order("SortKey"),
+      rowLimit: 30, paged: true, fields: ["Customer", "Title", "Day", "Amount", "Ticket"], formatter: spTicketRows() });
+    v.push({ list: "issues", title: P + " Not reported", query: where(and(eq("Period", P), eq("IssueType", "Not reported"))) + order("SortKey"),
+      rowLimit: 30, paged: true, fields: ["Customer", "Title", "Day"], formatter: "" });
+    v.push({ list: "issues", title: P + " Anomalies", query: where(and(eq("Period", P), eq("IssueType", "Volume anomaly"))) + order("SortKey"),
+      rowLimit: 15, paged: true, fields: ["Customer", "Title", "Day", "Amount", "Usual", "ChangePct"], formatter: "" });
+  });
+  v.push({ list: "trend", title: "Last " + SP_TREND_DAYS + " days", query: group("Title") + order("Title", "DayDate"), rowLimit: 100, paged: true,
+    fields: ["Day", "Rate", "NotReconciled", "NotReported", "InScope"], formatter: "" });
+  const weeks: string[] = [];
+  for (let k = 1; k <= SP_WEEKS; k++) weeks.push(spWeekField(k));
+  v.push({ list: "scorecard", title: "Scorecard", query: order("SortKey"), rowLimit: 100, paged: true, fields: ["Title"].concat(weeks, ["Change"]), formatter: "" });
+  v.push({ list: "recurring", title: "Recurring", query: order("SortKey"), rowLimit: 30, paged: true,
+    fields: ["Customer", "Title", "WeeksAffected", "Days", "LongestRun", "VarianceSum", "TicketedPct", "LastSeen"], formatter: "" });
+  return v;
+}
+function spColumnFormatters(): { list: string; field: string; formatter: string }[] {
+  const out = [
+    { list: "summary", field: "Rate", formatter: spPercent() },
+    { list: "trend", field: "Rate", formatter: spRateBar() },
+    { list: "scorecard", field: "Change", formatter: spChange() },
+    { list: "recurring", field: "TicketedPct", formatter: spPercent() },
+    { list: "issues", field: "ChangePct", formatter: spPercent() }];
+  for (let k = 1; k <= SP_WEEKS; k++) out.push({ list: "scorecard", field: spWeekField(k), formatter: spHeat() });
+  return out;
+}
+
+/* ---------- $batch requests ---------- */
+
+function spUrl(site: string, list: string, rest: string): string {
+  return site.replace(/\/$/, "") + "/_api/web/lists/getbytitle('" + encodeURIComponent(list.replace(/'/g, "''")) + "')" + rest;
+}
+function spOp(method: string, url: string, body: string, extraHeaders: string[]): string {
+  const h = ["Accept: application/json;odata=verbose"].concat(body ? ["Content-Type: application/json;odata=verbose"] : [], extraHeaders);
+  return method + " " + url + " HTTP/1.1\r\n" + h.join("\r\n") + "\r\n\r\n" + body;
+}
+/** Splits operations into $batch requests of at most `size` operations, keeping their order. */
+function spBatch(ops: string[], size: number, label: string, start: number): SpBatch[] {
+  const out: SpBatch[] = [];
+  for (let k = 0; k < ops.length; k += size) {
+    const id = (start + out.length + 1) + "_" + Math.floor(Math.random() * 1e9).toString(16);
+    const b = "batch_" + id, c = "changeset_" + id;
+    const part = ops.slice(k, k + size);
+    let body = "--" + b + "\r\nContent-Type: multipart/mixed; boundary=\"" + c + "\"\r\nContent-Transfer-Encoding: binary\r\n\r\n";
+    part.forEach(op => { body += "--" + c + "\r\nContent-Type: application/http\r\nContent-Transfer-Encoding: binary\r\n\r\n" + op + "\r\n\r\n"; });
+    body += "--" + c + "--\r\n\r\n--" + b + "--\r\n";
+    out.push({ boundary: b, body, operations: part.length, label: label + " " + (Math.floor(k / size) + 1) + "/" + Math.ceil(ops.length / size) });
+  }
+  return out;
+}
+
+/** One-off: lists, columns, views and formatting, in dependency order (lists → columns → views → view columns). */
+function spSetup(site: string, size: number): SpBatch[] {
+  const lists = spLists(), byKey = new Map<string, SpList>();
+  lists.forEach(l => byKey.set(l.key, l));
+  const x = (v: string): string => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  const merge = ["IF-MATCH: *", "X-HTTP-Method: MERGE"];
+  const phase1: string[] = [], phase2: string[] = [], phase3: string[] = [], phase4: string[] = [];
+  lists.forEach(l => {
+    phase1.push(spOp("POST", site.replace(/\/$/, "") + "/_api/web/lists", JSON.stringify({ __metadata: { type: "SP.List" }, BaseTemplate: 100, Title: l.title, Description: l.desc, AllowContentTypes: true, ContentTypesEnabled: false }), []));
+    phase2.push(spOp("POST", spUrl(site, l.title, "/fields/getbyinternalnameortitle('Title')"), JSON.stringify({ __metadata: { type: "SP.Field" }, Title: l.titleName }), merge));
+    l.fields.forEach(f => {
+      const xml = "<Field Type=\"" + f.t + "\" Name=\"" + f.n + "\" StaticName=\"" + f.n + "\" DisplayName=\"" + x(f.d) + "\"" +
+        (f.t === "Number" ? " Decimals=\"0\"" : "") + (f.t === "Note" ? " NumLines=\"6\" RichText=\"FALSE\"" : "") + " />";
+      // Options 8 = AddFieldInternalNameHint: keep Name as the internal name
+      phase2.push(spOp("POST", spUrl(site, l.title, "/fields/createfieldasxml"),
+        JSON.stringify({ parameters: { __metadata: { type: "SP.XmlSchemaFieldCreationInformation" }, SchemaXml: xml, Options: 8 } }), []));
+    });
+  });
+  spColumnFormatters().forEach(c => phase3.push(spOp("POST", spUrl(site, (byKey.get(c.list) as SpList).title, "/fields/getbyinternalnameortitle('" + c.field + "')"),
+    JSON.stringify({ __metadata: { type: "SP.Field" }, CustomFormatter: c.formatter }), merge)));
+  spViews().forEach(v => {
+    const list = (byKey.get(v.list) as SpList).title, view = "/views/getbytitle('" + encodeURIComponent(v.title) + "')";
+    phase3.push(spOp("POST", spUrl(site, list, "/views"), JSON.stringify({ __metadata: { type: "SP.View" }, Title: v.title, PersonalView: false, ViewQuery: v.query, RowLimit: v.rowLimit, Paged: v.paged }), []));
+    phase4.push(spOp("POST", spUrl(site, list, view + "/viewfields/removeallviewfields"), "", []));
+    v.fields.forEach(f => phase4.push(spOp("POST", spUrl(site, list, view + "/viewfields/addviewfield('" + f + "')"), "", [])));
+    if (v.formatter) phase4.push(spOp("POST", spUrl(site, list, view), JSON.stringify({ __metadata: { type: "SP.View" }, CustomFormatter: v.formatter }), merge));
+  });
+  return spBatch(phase1, size, "Create lists", 0)
+    .concat(spBatch(phase2, size, "Create columns", 100), spBatch(phase3, size, "Create views", 200), spBatch(phase4, size, "View columns", 300));
+}
+
+/** Daily: delete the lists' current items, add the new rows, retitle the scorecard week columns. */
+function spDaily(site: string, info: SpListInfo[], rows: { [key: string]: SpRow[] }, weekTitles: string[], size: number, warnings: string[]): SpBatch[] {
+  const del: string[] = [], add: string[] = [], meta: string[] = [];
+  const merge = ["IF-MATCH: *", "X-HTTP-Method: MERGE"];
+  spLists().forEach(l => {
+    const i = info.filter(z => z.title === l.title)[0];
+    if (!i || !i.type) { warnings.push("SharePoint list '" + l.title + "' not found — run the setup flow first."); return; }
+    (i.items || []).forEach(it => del.push(spOp("POST", spUrl(site, l.title, "/items(" + it.Id + ")"), "", ["IF-MATCH: *", "X-HTTP-Method: DELETE"])));
+    (rows[l.key] || []).forEach(r => {
+      const body: SpRow = {};
+      Object.keys(r).forEach(k => { if (r[k] !== null && r[k] !== undefined) body[k] = r[k]; });
+      add.push(spOp("POST", spUrl(site, l.title, "/items"), JSON.stringify({ __metadata: { type: i.type } }).slice(0, -1) + "," + JSON.stringify(body).slice(1), []));
+    });
+    if (l.key === "scorecard") weekTitles.forEach((t, k) => meta.push(spOp("POST", spUrl(site, l.title, "/fields/getbyinternalnameortitle('" + spWeekField(k + 1) + "')"),
+      JSON.stringify({ __metadata: { type: "SP.Field" }, Title: t }), merge)));
+  });
+  return spBatch(del, size, "Remove old rows", 0).concat(spBatch(meta.concat(add), size, "Add rows", 500));
+}
+
+/* ---------- the rows ---------- */
+
+/** Scorecard column titles: start date of each of the last SP_WEEKS weeks, oldest first ("—" padding when fewer). */
+function spWeekTitles(M: Model): string[] {
+  const t: string[] = [];
+  const lastWeek = Math.floor(M.LAST / 7);
+  for (let k = SP_WEEKS - 1; k >= 0; k--) { const w = lastWeek - k; t.push(w >= 0 ? "Wk " + md(M, w * 7) : "— " + (k + 1)); }
+  return t;
+}
+
+function spData(M: Model, months: number[][], mo: number, periods: SpPeriod[], through: string): { [key: string]: SpRow[] } {
+  const out: { [key: string]: SpRow[] } = { summary: [], interfaces: [], issues: [], trend: [], scorecard: [], recurring: [] };
+  const plain = (h: string): string => h.replace(/<\/?b>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  const status = (attN: number, att: number, miss: number, g: number): string =>
+    attN ? "Variance without ticket" : att ? "Variance with ticket" : miss ? "Not reported" : g ? "Reconciled" : "";
+  const day = (d: number): string => DOW[d % 7] + " " + md(M, d);
+  const counts = (o: { scope: number; g: number; att: number; attT: number; attN: number; miss: number; sum: number }): SpRow =>
+    ({ InScope: o.scope, Reconciled: o.g, NotReconciled: o.att, Ticketed: o.attT, NotTicketed: o.attN, NotReported: o.miss, VarianceSum: Math.round(o.sum) });
+
+  periods.forEach(P => {
+    const o = scan(M, P.d1, P.d2, -1, -1, false);
+    const who: { a: number; o: Scan }[] = [{ a: -1, o }];
+    o.byA.map((b, a) => ({ a, b })).filter(z => z.b.g + z.b.att + z.b.miss + z.b.scope > 0)
+      .sort((p, q) => q.b.sum - p.b.sum || q.b.miss - p.b.miss || M.acc[p.a].localeCompare(M.acc[q.a]))
+      .forEach(z => who.push({ a: z.a, o: scan(M, P.d1, P.d2, z.a, -1, false) }));
+    who.forEach((w, rank) => {
+      const name = w.a < 0 ? SP_ALL : M.acc[w.a];
+      const hl = findings(M, P.v, P.d1, P.d2, w.a, w.o, months, mo).map((h, k) => (k + 1) + ". " + plain(h)).join("\n");
+      const r: SpRow = { Title: name, Period: P.name, Covers: P.label, SortKey: rank, Status: status(w.o.attN, w.o.att, w.o.miss, w.o.g), Rate: w.o.rate, Highlights: hl, DataThrough: through };
+      const c = counts(w.o);
+      Object.keys(c).forEach(k => { r[k] = c[k]; });
+      out.summary.push(r);
+      w.o.byI.forEach((b, i) => {
+        if (!(b.scope || b.g + b.att + b.miss || b.rec)) return;
+        const ri: SpRow = { Title: M.ifs[i], Customer: name, Period: P.name, Status: status(b.attN, b.att, b.miss, b.g), Received: b.rec, Loaded: b.ld, Errors: b.err, Pending: b.pend };
+        const ci = counts(b);
+        Object.keys(ci).forEach(k => { ri[k] = ci[k]; });
+        out.interfaces.push(ri);
+      });
+    });
+    o.items.slice(0, SP_CAP_VARIANCES).forEach((x, k) => out.issues.push({ Title: M.ifs[x.i], Customer: M.acc[x.a], Period: P.name, IssueType: "Variance",
+      Day: day(x.d), DayDate: iso(M, x.d), Amount: Math.round(x.v), Ticket: x.t ? "Tracked" : "Not tracked", SortKey: k + 1 }));
+    o.missL.slice().sort((p, q) => q.d - p.d || M.acc[p.a].localeCompare(M.acc[q.a]) || p.i - q.i).slice(0, SP_CAP_NOT_REPORTED)
+      .forEach((x, k) => out.issues.push({ Title: M.ifs[x.i], Customer: M.acc[x.a], Period: P.name, IssueType: "Not reported", Day: day(x.d), DayDate: iso(M, x.d), SortKey: k + 1 }));
+    o.anom.slice(0, SP_CAP_ANOMALIES).forEach((x, k) => out.issues.push({ Title: M.ifs[x.i], Customer: M.acc[x.a], Period: P.name, IssueType: "Volume anomaly",
+      Day: day(x.d), DayDate: iso(M, x.d), Amount: x.v, Usual: x.m, ChangePct: Math.round((x.v - x.m) / x.m * 100), SortKey: k + 1 }));
+  });
+
+  // daily trend, portfolio + each customer
+  const from = Math.max(0, M.LAST - SP_TREND_DAYS + 1);
+  for (let a = -1; a < M.NA; a++) for (let d = from; d <= M.LAST; d++) {
+    const x = scan(M, d, d, a, -1, true);
+    if (!(x.scope + x.g + x.att + x.miss)) continue;
+    out.trend.push({ Title: a < 0 ? SP_ALL : M.acc[a], Day: day(d), DayDate: iso(M, d), Rate: x.rate, NotReconciled: x.att, NotReported: x.miss, InScope: x.scope });
+  }
+
+  // weekly scorecard (last SP_WEEKS weeks; change = average of the last 4 weeks vs the 4 before, over all weeks)
+  const lastWeek = Math.floor(M.LAST / 7);
+  const wEnd = (w: number): number => Math.min(M.LAST, w * 7 + 6);
+  const avg = (v: (number | null)[]): number | null => { const n = v.filter(z => z !== null) as number[]; return n.length ? n.reduce((p, q) => p + q, 0) / n.length : null; };
+  const card = (title: string, sort: number, val: (x: Scan) => number | null, a: number): void => {
+    const all: (number | null)[] = [];
+    for (let w = 0; w <= lastWeek; w++) all.push(val(scan(M, w * 7, wEnd(w), a, -1, true)));
+    if (!all.some(z => z !== null)) return;
+    const r: SpRow = { Title: title, SortKey: sort };
+    for (let k = 1; k <= SP_WEEKS; k++) { const w = lastWeek - SP_WEEKS + k; r[spWeekField(k)] = w >= 0 ? all[w] : null; }
+    const rec = avg(all.slice(-4)), old = avg(all.slice(-8, -4));
+    r.Change = rec !== null && old !== null && all.length >= 8 ? Math.round(rec - old) : null;
+    out.scorecard.push(r);
+  };
+  card(SP_ALL, 0, x => pct(x.g, x.att), -1);
+  M.acc.forEach((n, a) => card(n, a + 1, x => pct(x.g, x.att), a));
+  card(SP_ALL + " – ticket coverage", 900, x => x.att ? Math.round(100 * x.attT / x.att) : null, -1);
+  card(SP_ALL + " – schedule adherence", 901, x => { const t = x.g + x.att + x.miss; return t ? Math.round(100 * (1 - x.miss / t)) : null; }, -1);
+
+  recurring(M).slice(0, SP_CAP_RECURRING).forEach((p, k) => out.recurring.push({ Title: M.ifs[p.i], Customer: M.acc[p.a], WeeksAffected: p.wk.size, Days: p.n,
+    LongestRun: p.str, VarianceSum: Math.round(p.sum), TicketedPct: Math.round(100 * p.t / p.n), LastSeen: iso(M, p.last), SortKey: k + 1 }));
+  return out;
 }
