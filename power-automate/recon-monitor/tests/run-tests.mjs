@@ -93,4 +93,30 @@ test('sample config parses and the template still holds its placeholder', () => 
   assert.equal(t.split('"__RECON_DATA__"').length, 2);
 });
 
+// ---- SharePoint live page: built-in .xlsx reader + generated page ----
+const reader = new Function(readFileSync(path.join(ROOT, 'sharepoint/src/xlsx-reader.js'), 'utf8') + '\nreturn readXlsx;')();
+const buf = readFileSync(path.join(ROOT, 'tests/fixtures/tracker.xlsx'));
+const sheets = await reader(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+test('xlsx reader returns sheets, serial dates, text, numbers, booleans and blanks', () => {
+  assert.deepEqual(Object.keys(sheets), ['Enrollment IB', 'Recon Report Schedule']);
+  const e = sheets['Enrollment IB'];
+  assert.deepEqual(e[2], HDR);
+  assert.deepEqual(e[4], [day(0), 'Plan B & <Co>', 50, 40, 0, 0, 10, 'INC1', '']);
+  assert.deepEqual(e[6], [day(1), 'Plan B & <Co>', '', '', '', '', '', '', 'Holiday']);
+  assert.ok(e.every((r) => r.length === 9));
+  assert.deepEqual(sheets['Recon Report Schedule'][1], ['Plan A', 'Daily', true]);
+});
+test('workbook read from .xlsx gives the expected dashboard numbers', () => {
+  const { data, digest } = run(sheets, { interfaces: [{ name: 'Enrollment IB' }] });
+  assert.deepEqual(data.x, [[1, 1, 0]]);
+  assert.deepEqual(digest.weekly.tiles, { inScope: 4, fullyReconciled: 1, notFullyReconciled: 2, trackedViaTicket: 1, notTrackedViaTicket: 1, notReported: 0, varianceSum: 60, reconciledRate: 33 });
+});
+test('SharePoint page is built from the current sources', async () => {
+  const aspx = readFileSync(path.join(ROOT, 'sharepoint/Reconciliation-Monitor.aspx'), 'utf8');
+  const js = aspx.slice(aspx.indexOf('<script>') + 8, aspx.lastIndexOf('</script>'));
+  new Function(js); // parses
+  for (const part of ['sharepoint/src/xlsx-reader.js', 'sharepoint/src/loader.js']) assert.ok(js.includes(readFileSync(path.join(ROOT, part), 'utf8')), part + ' changed — run node sharepoint/build.mjs');
+  assert.ok(js.includes('function startDashboard(D){') && !js.includes('__RECON_DATA__'));
+});
+
 console.log(`\n${n} tests passed`);

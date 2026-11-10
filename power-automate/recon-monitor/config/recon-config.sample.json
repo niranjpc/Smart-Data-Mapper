@@ -1,5 +1,8 @@
 {
   "startDate": "2026-06-29",
+  "siteUrl": "https://contoso.sharepoint.com/sites/TechOps",
+  "trackerPath": "/sites/TechOps/Shared Documents/Recon/Recon Tracker.xlsx",
+  "timeZone": "America/New_York",
   "homeUrl": "https://contoso.sharepoint.com/sites/TechOps/SitePages/Home.aspx",
   "dashboardUrl": "https://contoso.sharepoint.com/sites/TechOps/SiteAssets/ReconMonitor/Reconciliation-Monitor.html",
   "dateOrder": "MDY",
