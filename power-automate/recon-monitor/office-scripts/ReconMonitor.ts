@@ -1,0 +1,661 @@
+/**
+ * Reconciliation Monitor — Office Script (run from Power Automate with "Run script").
+ *
+ * Reads the recon tracker workbook, applies the Reconciliation Monitor rules and returns
+ *   - dataJson   : the dataset the dashboard page renders (injected into the HTML template by the flow)
+ *   - digestJson : every number the dashboard shows for the current day / week / month + history
+ *   - subject / emailHtml / needsAttention : ready-made daily digest for mail or Teams
+ *   - warnings   : anything in the workbook that did not match the configuration
+ *
+ * Parameters (all optional):
+ *   configJson : contents of recon-config.json ("" = built-in defaults)
+ *   asOf       : yyyy-MM-dd upper bound for the data (normally "today" in the business time zone)
+ *   mode       : "build" (default) or "inspect" (lists sheets + detected columns in warnings)
+ */
+
+type Cell = string | number | boolean;
+/** [day, account, interface, received, loaded, error, pending, variance|null, ticket 0/1] */
+type Fact = [number, number, number, number, number, number, number, number | null, number];
+
+interface ColumnMap {
+  date?: string[]; account?: string[]; received?: string[]; loaded?: string[]; error?: string[];
+  pending?: string[]; variance?: string[]; ticket?: string[]; comment?: string[];
+}
+interface InterfaceCfg {
+  name: string; scheduleType?: string; sheet?: string; columns?: ColumnMap;
+  filterColumn?: string; filterEquals?: string;
+}
+interface ReconConfig {
+  startDate?: string; homeUrl?: string; dashboardUrl?: string; dateOrder?: string;
+  minRowsForDefaultDay?: number; scheduleSheet?: string;
+  accountAliases?: { [raw: string]: string }; ignoreAccounts?: string[]; unmappedAccounts?: string;
+  explainedCommentPattern?: string; varianceWhenMissing?: string;
+  anomalyMinMedian?: number; anomalyFactor?: number;
+  columns?: ColumnMap; interfaces?: InterfaceCfg[];
+}
+interface Tiles {
+  inScope: number; fullyReconciled: number; notFullyReconciled: number; trackedViaTicket: number;
+  notTrackedViaTicket: number; notReported: number; varianceSum: number; reconciledRate: number;
+}
+interface ReconResult {
+  ok: boolean; asOf: string; defaultDay: string; generated: string;
+  dataJson: string; digestJson: string;
+  daily: Tiles; weekly: Tiles; monthly: Tiles;
+  dailyLabel: string; weeklyLabel: string; monthlyLabel: string;
+  needsAttention: boolean; subject: string; emailHtml: string; warnings: string[];
+}
+
+interface Bucket {
+  g: number; att: number; attT: number; attN: number; miss: number; sum: number; scope: number;
+  rec: number; ld: number; err: number; pend: number;
+  top: string; topv: number; missI: string[]; an: number;
+}
+interface Item { a: number; i: number; d: number; v: number; t: boolean }
+interface Miss { a: number; i: number; d: number }
+interface Anom { a: number; i: number; d: number; v: number; m: number; dev: number }
+interface Scan {
+  g: number; att: number; attT: number; attN: number; miss: number; sum: number; scope: number;
+  rate: number | null; items: Item[]; missL: Miss[]; anom: Anom[]; byI: Bucket[]; byA: Bucket[];
+}
+interface CellState { s: string; r: Fact | null; v: number; t: boolean }
+interface Model {
+  acc: string[]; ifs: string[]; typ: string[]; sch: { [acc: string]: { [typ: string]: string } };
+  F: Map<number, Fact>; X: Set<number>; NA: number; NI: number; T0: number; LAST: number; DEF: number;
+  anomMin: number; anomFactor: number;
+}
+interface Group { k: string; n: number; sum: number; x: Item }
+interface Rec { a: number; i: number; wk: Set<number>; n: number; sum: number; t: number; last: number; str: number; cur: number; prev: number }
+
+const MS_DAY = 86400000;
+const KEY = 100000; // day slots per (account, interface) key
+const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+const DEFAULT_COLUMNS: ColumnMap = {
+  date: ["^date$", "run date", "recon date", "report date", "process(ed|ing)? date", "^day$"],
+  account: ["^account", "customer", "client", "health ?plan"],
+  received: ["received", "triggered"],
+  loaded: ["loaded", "extracted"],
+  error: ["error", "rejected"],
+  pending: ["pending", "work ?basket", "\\bwb\\b"],
+  variance: ["variance", "difference"],
+  ticket: ["ticket", "jira", "incident"],
+  comment: ["comment", "remark", "notes?$"]
+};
+const DEFAULT_INTERFACES: string[] = [
+  "Enrollment IB", "Claims Clearing House", "Claims IB", "Provider IB – Tax entity", "Provider IB – Practitioner",
+  "Provider IB – Supplier", "Provider IB – Supplier Location", "Provider IB – Practitioner Role", "Authorization IB",
+  "Accumulator IB", "ID Cards-Extract", "ID Cards-Acknowledgement", "Correspondences- Extract", "Member Packets-Extract",
+  "Member Packets-Acknowledgement", "Claims Payment Extract", "External Pricing", "External Claims Editing",
+  "Encounter Submission", "Encounter Rejections"
+];
+
+function main(workbook: ExcelScript.Workbook, configJson: string = "", asOf: string = "", mode: string = "build"): ReconResult {
+  const warnings: string[] = [];
+  const cfg: ReconConfig = configJson && configJson.trim() ? JSON.parse(configJson) : {};
+  const interfaces: InterfaceCfg[] = cfg.interfaces && cfg.interfaces.length ? cfg.interfaces : DEFAULT_INTERFACES.map(n => {
+    const c: InterfaceCfg = { name: n }; return c;
+  });
+  const ifs = interfaces.map(x => x.name);
+  const typ = interfaces.map(x => x.scheduleType ? x.scheduleType
+    : /^Provider IB/.test(x.name) ? "Provider IB" : x.name === "Encounter Rejections" ? "Encounter Submission" : x.name);
+
+  // ---- calendar: day 0 is the Monday on/before startDate ----
+  let T0 = parseDay(cfg.startDate || "2026-06-29", "YMD");
+  if (T0 === null) throw new Error("startDate in the configuration is not a valid yyyy-MM-dd date.");
+  T0 -= ((T0 + 3) % 7 + 7) % 7; // 1970-01-01 was a Thursday -> (n+3)%7 is 0 on Mondays
+  const order = (cfg.dateOrder || "MDY").toUpperCase();
+  const asOfDay = asOf && asOf.trim() ? parseDay(asOf.trim(), "YMD") : null;
+  const cap = asOfDay === null ? Number.MAX_SAFE_INTEGER : asOfDay - T0;
+
+  // ---- account names: tracker names -> dashboard names ----
+  const alias = new Map<string, string>();
+  const acc: string[] = [];
+  const accIdx = new Map<string, number>();
+  const addAcc = (n: string): number => {
+    let k = accIdx.get(n);
+    if (k === undefined) { k = acc.length; acc.push(n); accIdx.set(n, k); }
+    return k;
+  };
+  const aliases = cfg.accountAliases || {};
+  Object.keys(aliases).forEach(raw => { alias.set(norm(raw), aliases[raw]); addAcc(aliases[raw]); });
+  const ignore = new Set<string>((cfg.ignoreAccounts || []).map(norm));
+  const dropUnmapped = (cfg.unmappedAccounts || "keep").toLowerCase() === "drop";
+  const unmapped = new Set<string>();
+  const resolve = (raw: string): number => {
+    const n = norm(raw);
+    if (!n || ignore.has(n)) return -1;
+    const m = alias.get(n);
+    if (m !== undefined) return addAcc(m);
+    if (!unmapped.has(n)) { unmapped.add(n); warnings.push("Account '" + raw.trim() + "' is not in accountAliases — " + (dropUnmapped ? "dropped." : "kept under its tracker name.")); }
+    return dropUnmapped ? -1 : addAcc(raw.trim());
+  };
+
+  // ---- read the tracker ----
+  const sheets = new Map<string, Cell[][]>();
+  workbook.getWorksheets().forEach(ws => {
+    const rng = ws.getUsedRange();
+    sheets.set(norm(ws.getName()), rng ? rng.getValues() : []);
+  });
+  const explained = new RegExp(cfg.explainedCommentPattern || "\\b(n\\/?a|not applicable|no run|no file|holiday|on hold)\\b", "i");
+  const facts = new Map<number, Fact>();
+  const X = new Set<number>();
+  const NI = ifs.length;
+  let maxDay = -1, badDates = 0;
+  const inspect = mode.toLowerCase() === "inspect";
+
+  interfaces.forEach((ic, i) => {
+    const sheetName = ic.sheet || ic.name;
+    const values = sheets.get(norm(sheetName));
+    if (!values) { warnings.push("Interface '" + ic.name + "': sheet '" + sheetName + "' not found."); return; }
+    const col = (role: string): string[] => {
+      const own = ic.columns ? pick(ic.columns, role) : undefined;
+      const shared = cfg.columns ? pick(cfg.columns, role) : undefined;
+      return own || shared || pick(DEFAULT_COLUMNS, role) || [];
+    };
+    let hr = -1, cDate: number[] = [], cAcc: number[] = [];
+    for (let r = 0; r < Math.min(values.length, 25) && hr < 0; r++) {
+      cDate = findCols(values[r], col("date")); cAcc = findCols(values[r], col("account"));
+      if (cDate.length && cAcc.length) hr = r;
+    }
+    if (hr < 0) { warnings.push("Interface '" + ic.name + "': no header row with a date and an account column in sheet '" + sheetName + "'."); return; }
+    const H = values[hr];
+    const cRec = findCols(H, col("received")), cLd = findCols(H, col("loaded")), cErr = findCols(H, col("error")),
+      cPend = findCols(H, col("pending")), cVar = findCols(H, col("variance")), cTkt = findCols(H, col("ticket")),
+      cCom = findCols(H, col("comment"));
+    const cFil = ic.filterColumn ? findCols(H, [ic.filterColumn]) : [];
+    const names = (c: number[]): string => c.length ? c.map(k => String(H[k]).trim()).join(" + ") : "—";
+    if (inspect) warnings.push("[inspect] " + ic.name + " <- sheet '" + sheetName + "' header row " + (hr + 1) + " | date: " + names(cDate.slice(0, 1)) +
+      " | account: " + names(cAcc.slice(0, 1)) + " | received: " + names(cRec) + " | loaded: " + names(cLd) + " | error: " + names(cErr) +
+      " | pending: " + names(cPend) + " | variance: " + names(cVar.slice(0, 1)) + " | ticket: " + names(cTkt.slice(0, 1)) + " | comment: " + names(cCom.slice(0, 1)));
+    if (!cRec.length) warnings.push("Interface '" + ic.name + "': no 'received' column matched.");
+    const computeVar = !cVar.length && (cfg.varianceWhenMissing || "none").toLowerCase() !== "none";
+    if (!cVar.length) warnings.push("Interface '" + ic.name + "': no variance column matched — " + (computeVar ? "using received − loaded − error − pending." : "every reported row will count as reconciled."));
+
+    for (let r = hr + 1; r < values.length; r++) {
+      const row = values[r];
+      const dv = row[cDate[0]];
+      if (dv === "" || dv === null || dv === undefined) continue;
+      const day = typeof dv === "number" ? Math.floor(dv) - 25569 : parseDay(String(dv), order);
+      if (day === null) { badDates++; continue; }
+      const d = day - T0;
+      if (d < 0 || d > cap || d >= KEY) continue;
+      if (cFil.length && norm(String(row[cFil[0]])) !== norm(ic.filterEquals || "")) continue;
+      const a = resolve(String(row[cAcc[0]]));
+      if (a < 0) continue;
+      let hasNum = false, isExplained = cCom.length > 0 && explained.test(String(row[cCom[0]]));
+      const total = (cols: number[]): number => {
+        let s = 0;
+        cols.forEach(k => {
+          const n = num(row[k]);
+          if (n !== null) { s += n; hasNum = true; } else if (explained.test(String(row[k]))) isExplained = true;
+        });
+        return s;
+      };
+      const rec = total(cRec), ld = total(cLd), er = total(cErr), pe = total(cPend);
+      let v: number | null = cVar.length ? num(row[cVar[0]]) : null;
+      if (v !== null) hasNum = true;
+      if (v === null && computeVar && hasNum) v = rec - ld - er - pe;
+      const k = (a * NI + i) * KEY + d;
+      if (isExplained && !hasNum) { X.add(k); if (d > maxDay) maxDay = d; continue; }
+      const tk = cTkt.length && isTicket(row[cTkt[0]]) ? 1 : 0;
+      const z = facts.get(k);
+      if (!z) facts.set(k, [d, a, i, rec, ld, er, pe, v === null ? null : Math.abs(v), tk]);
+      else {
+        z[3] += rec; z[4] += ld; z[5] += er; z[6] += pe;
+        z[7] = z[7] === null && v === null ? null : (z[7] || 0) + Math.abs(v || 0);
+        z[8] = z[8] || tk;
+      }
+      if (d > maxDay) maxDay = d;
+    }
+  });
+  if (badDates) warnings.push(badDates + " row(s) skipped because the date could not be read (check dateOrder).");
+
+  // ---- schedule ----
+  const sch: { [acc: string]: { [t: string]: string } } = {};
+  const schName = cfg.scheduleSheet || "Recon Report Schedule";
+  const sv = sheets.get(norm(schName));
+  if (!sv) warnings.push("Schedule sheet '" + schName + "' not found — nothing can be flagged as scheduled but not reported.");
+  else readSchedule(sv, typ, resolve, acc, sch, warnings, inspect);
+
+  if (maxDay < 0) warnings.push("No tracker rows were read. Run with mode = inspect and adjust recon-config.json.");
+  const LAST = Math.max(0, asOfDay === null ? maxDay : Math.min(maxDay, cap));
+  const NA = acc.length;
+
+  const model: Model = { acc, ifs, typ, sch, F: facts, X, NA, NI, T0, LAST, DEF: LAST, anomMin: cfg.anomalyMinMedian || 200, anomFactor: cfg.anomalyFactor || 3 };
+  const perDayRows: number[] = [];
+  facts.forEach(r => { perDayRows[r[0]] = (perDayRows[r[0]] || 0) + 1; });
+  const minRows = cfg.minRowsForDefaultDay === undefined ? 100 : cfg.minRowsForDefaultDay;
+  while (model.DEF > 0 && (perDayRows[model.DEF] || 0) < minRows) model.DEF--;
+
+  // ---- dataset for the dashboard page ----
+  const generated = new Date().toISOString();
+  const fOut: Fact[] = []; facts.forEach(r => fOut.push(r));
+  const xOut: number[][] = []; X.forEach(k => xOut.push([k % KEY, Math.floor(Math.floor(k / KEY) / NI), Math.floor(k / KEY) % NI]));
+  const data = { asOf: iso(model, LAST), start: iso(model, 0), gen: generated, home: cfg.homeUrl || "", acc, ifs, typ, def: model.DEF, f: fOut, sch, x: xOut };
+  // "<" and the JS line separators are escaped so the JSON is safe inside a <script> block
+  const dataJson = JSON.stringify(data).replace(/</g, "\\u003c")
+    .split(String.fromCharCode(0x2028)).join("\\u2028").split(String.fromCharCode(0x2029)).join("\\u2029");
+
+  // ---- digest: the numbers behind every dashboard section ----
+  const DEF = model.DEF, wk = Math.floor(DEF / 7) * 7;
+  const months = monthList(model);
+  const mo = months.length - 1;
+  const mFrom = Math.max(0, dayIdx(model, months[mo][0], months[mo][1], 1)), mTo = Math.min(LAST, dayIdx(model, months[mo][0], months[mo][1] + 1, 0));
+  const oD = scan(model, DEF, DEF, -1, -1, false), oW = scan(model, wk, Math.min(LAST, wk + 6), -1, -1, false), oM = scan(model, mFrom, mTo, -1, -1, false);
+  const wTo = Math.min(LAST, wk + 6);
+  const dailyLabel = DOW[DEF % 7] + " " + md(model, DEF) + " run";
+  const weeklyLabel = "Week of " + md(model, wk) + " – " + md(model, wk + 6) + (wTo < wk + 6 ? " · updated through " + DOW[wTo % 7] + " " + md(model, wTo) : "");
+  const monthlyLabel = MONTHS[months[mo][1]] + " " + months[mo][0];
+  const hD = findings(model, "d", DEF, DEF, -1, oD, months, mo), hW = findings(model, "w", wk, wTo, -1, oW, months, mo), hM = findings(model, "m", mFrom, mTo, -1, oM, months, mo);
+  const digest = {
+    asOf: data.asOf, generated, defaultDay: iso(model, DEF),
+    daily: section(model, dailyLabel, DEF, DEF, oD, hD),
+    weekly: section(model, weeklyLabel, wk, wTo, oW, hW),
+    monthly: section(model, monthlyLabel, mFrom, mTo, oM, hM),
+    history: history(model)
+  };
+  const needsAttention = oD.attN > 0 || oD.miss > 0;
+  const subject = "Reconciliation Monitor · " + DOW[DEF % 7] + " " + md(model, DEF) + " · " + (oD.rate === null ? "no feeds reported" : oD.rate + "% reconciled") +
+    (oD.attN ? " · " + oD.attN + " without ticket" : "") + (oD.miss ? " · " + oD.miss + " not reported" : "");
+
+  return {
+    ok: maxDay >= 0, asOf: data.asOf, defaultDay: iso(model, DEF), generated,
+    dataJson, digestJson: JSON.stringify(digest),
+    daily: tiles(oD), weekly: tiles(oW), monthly: tiles(oM),
+    dailyLabel, weeklyLabel, monthlyLabel, needsAttention, subject,
+    emailHtml: emailHtml(model, dailyLabel, oD, hD, weeklyLabel, oW, cfg.dashboardUrl || ""), warnings
+  };
+}
+
+/* ======================= reading helpers ======================= */
+
+function norm(s: string): string { return String(s === null || s === undefined ? "" : s).replace(/\s+/g, " ").trim().toLowerCase(); }
+
+function pick(m: ColumnMap, role: string): string[] | undefined {
+  switch (role) {
+    case "date": return m.date; case "account": return m.account; case "received": return m.received;
+    case "loaded": return m.loaded; case "error": return m.error; case "pending": return m.pending;
+    case "variance": return m.variance; case "ticket": return m.ticket; case "comment": return m.comment;
+  }
+  return undefined;
+}
+
+/** Indexes of the header cells matching any pattern (case-insensitive regular expressions). */
+function findCols(header: Cell[], patterns: string[]): number[] {
+  const out: number[] = [];
+  const res = patterns.map(p => new RegExp(p, "i"));
+  for (let c = 0; c < header.length; c++) {
+    const h = String(header[c] === null || header[c] === undefined ? "" : header[c]).replace(/\s+/g, " ").trim();
+    if (h && res.some(re => re.test(h))) out.push(c);
+  }
+  return out;
+}
+
+function num(v: Cell): number | null {
+  if (typeof v === "number") return isFinite(v) ? v : null;
+  if (typeof v !== "string") return null;
+  let s = v.replace(/[,\s]/g, "");
+  let neg = false;
+  if (/^\(.*\)$/.test(s)) { neg = true; s = s.slice(1, -1); }
+  if (!/^-?\d+(\.\d+)?$/.test(s)) return null;
+  return neg ? -Number(s) : Number(s);
+}
+
+function isTicket(v: Cell): boolean {
+  const s = norm(String(v === null || v === undefined ? "" : v));
+  return s !== "" && !/^(n\/?a|no|none|nil|-|0|false)$/.test(s);
+}
+
+/** Text date -> days since 1970-01-01 (UTC). order: YMD | MDY | DMY for all-numeric dates. */
+function parseDay(s: string, order: string): number | null {
+  const t = s.trim();
+  let y = 0, m = 0, d = 0;
+  let p = /^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/.exec(t);
+  if (p) { y = +p[1]; m = +p[2]; d = +p[3]; }
+  else if ((p = /^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/.exec(t))) {
+    if (order === "DMY") { d = +p[1]; m = +p[2]; } else { m = +p[1]; d = +p[2]; }
+    y = +p[3];
+  } else if ((p = /^(\d{1,2})[-\s]([A-Za-z]{3})[A-Za-z]*[-\s,]+(\d{2,4})/.exec(t))) {
+    d = +p[1]; m = monthNo(p[2]); y = +p[3];
+  } else if ((p = /^([A-Za-z]{3})[A-Za-z]*\s+(\d{1,2}),?\s+(\d{2,4})/.exec(t))) {
+    m = monthNo(p[1]); d = +p[2]; y = +p[3];
+  } else return null;
+  if (y < 100) y += 2000;
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  return Math.round(Date.UTC(y, m - 1, d) / MS_DAY);
+}
+function monthNo(s: string): number { return MONTHS.map(x => x.toLowerCase()).indexOf(s.slice(0, 3).toLowerCase()) + 1; }
+
+/** "Mon-Fri", "Daily", "Tue, Thu", "1111100", "Y" ... -> seven 0/1 flags, Monday first. null = not understood. */
+function dayFlags(v: Cell): string | null {
+  const s = norm(String(v === null || v === undefined ? "" : v));
+  if (/^[01]{7}$/.test(s)) return s;
+  if (s === "" || /^(n\/?a|no|none|nil|-|0|false|not applicable)$/.test(s)) return "0000000";
+  if (/^(y|yes|x|true|1|daily|every ?day|all days|7 days)$/.test(s)) return "1111111";
+  if (/^(weekdays?|business days|week days)$/.test(s)) return "1111100";
+  const idx = (w: string): number => /^(mon(day)?|tue(s|sday)?|wed(nesday)?|thu(r|rs|rsday)?|fri(day)?|sat(urday)?|sun(day)?)s?\.?$/.test(w)
+    ? ["mo", "tu", "we", "th", "fr", "sa", "su"].indexOf(w.slice(0, 2)) : -1;
+  const f = [0, 0, 0, 0, 0, 0, 0];
+  let any = false;
+  const parts = s.split(/[,;\/&]|\band\b/);
+  for (let k = 0; k < parts.length; k++) {
+    const part = parts[k].trim();
+    if (!part) continue;
+    const r = /^([a-z]+)\.?\s*(?:-|–|to|through|thru)\s*([a-z]+\.?)$/.exec(part);
+    if (r) {
+      const a = idx(r[1]), b = idx(r[2]);
+      if (a < 0 || b < 0) return null;
+      for (let j = a; ; j = (j + 1) % 7) { f[j] = 1; if (j === b) break; }
+      any = true;
+    } else {
+      const a = idx(part);
+      if (a < 0) return null;
+      f[a] = 1; any = true;
+    }
+  }
+  return any ? f.join("") : null;
+}
+
+/**
+ * Schedule tab. Three layouts are recognised:
+ *   A) Account | Interface | Mon | Tue | ... | Sun      (any mark = scheduled)
+ *   B) Account | Interface | Schedule ("Mon-Fri", "Daily", ...)
+ *   C) Account | <one column per interface type>         (cell = "Mon-Fri", "Daily", "N/A", ...)
+ */
+function readSchedule(v: Cell[][], typ: string[], resolve: (raw: string) => number, acc: string[],
+  sch: { [acc: string]: { [t: string]: string } }, warnings: string[], inspect: boolean): void {
+  const types: string[] = [];
+  typ.forEach(t => { if (types.indexOf(t) < 0) types.push(t); });
+  const typeOf = (label: string): string | null => {
+    const n = norm(label).replace(/[–—]/g, "-");
+    for (let k = 0; k < types.length; k++) if (norm(types[k]).replace(/[–—]/g, "-") === n) return types[k];
+    return null;
+  };
+  let hr = -1, cAcc: number[] = [];
+  for (let r = 0; r < Math.min(v.length, 25) && hr < 0; r++) { cAcc = findCols(v[r], ["^account", "customer", "client", "health ?plan"]); if (cAcc.length) hr = r; }
+  if (hr < 0) { warnings.push("Schedule sheet: no header row with an account column."); return; }
+  const H = v[hr];
+  const cIf = findCols(H, ["interface", "feed", "report", "^type$"]);
+  const cDays: number[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].map(dn => { const c = findCols(H, ["^" + dn]); return c.length ? c[0] : -1; });
+  const cExpr = findCols(H, ["schedule", "frequency", "^days?$"]);
+  const layout = cIf.length && cDays.filter(c => c >= 0).length >= 5 ? "A" : cIf.length && cExpr.length ? "B" : "C";
+  if (inspect) warnings.push("[inspect] schedule layout " + layout + ", header row " + (hr + 1));
+  const unknown = new Set<string>();
+  const put = (a: number, t: string, flags: string): void => {
+    const s = sch[acc[a]] || (sch[acc[a]] = {});
+    const o = s[t] || "0000000";
+    let m = "";
+    for (let k = 0; k < 7; k++) m += flags.charAt(k) === "1" || o.charAt(k) === "1" ? "1" : "0";
+    s[t] = m;
+  };
+  for (let r = hr + 1; r < v.length; r++) {
+    const raw = String(v[r][cAcc[0]]);
+    if (!raw.trim()) continue;
+    const a = resolve(raw);
+    if (a < 0) continue;
+    if (layout === "C") {
+      for (let c = 0; c < H.length; c++) {
+        if (c === cAcc[0] || !String(H[c]).trim()) continue;
+        const t = typeOf(String(H[c]));
+        if (!t) { unknown.add(String(H[c]).trim()); continue; }
+        const fl = dayFlags(v[r][c]);
+        if (fl === null) warnings.push("Schedule: '" + String(v[r][c]) + "' (" + raw.trim() + " / " + t + ") not understood — treated as not scheduled.");
+        put(a, t, fl || "0000000");
+      }
+    } else {
+      const t = typeOf(String(v[r][cIf[0]]));
+      if (!t) { if (String(v[r][cIf[0]]).trim()) unknown.add(String(v[r][cIf[0]]).trim()); continue; }
+      let fl: string | null = "";
+      if (layout === "A") cDays.forEach(c => { fl += c >= 0 && dayFlags(v[r][c]) === "1111111" ? "1" : "0"; });
+      else fl = dayFlags(v[r][cExpr[0]]);
+      if (fl === null) warnings.push("Schedule: '" + String(v[r][cExpr[0]]) + "' (" + raw.trim() + " / " + t + ") not understood — treated as not scheduled.");
+      put(a, t, fl || "0000000");
+    }
+  }
+  unknown.forEach(u => warnings.push("Schedule: '" + u + "' does not match any interface scheduleType — ignored."));
+}
+
+/* ======================= dashboard rules ======================= */
+
+function iso(M: Model, i: number): string { return new Date((M.T0 + i) * MS_DAY).toISOString().slice(0, 10); }
+function md(M: Model, i: number): string { const s = iso(M, i); return (+s.slice(5, 7)) + "/" + (+s.slice(8, 10)); }
+function dayIdx(M: Model, y: number, m: number, d: number): number { return Math.round(Date.UTC(y, m, d) / MS_DAY) - M.T0; }
+function full(n: number | null): string {
+  if (n === null) return "–";
+  const r = Math.round(n);
+  return (r < 0 ? "-" : "") + String(Math.abs(r)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+function esc(s: string): string { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function median(a: number[]): number { const s = a.slice().sort((x, y) => x - y); return s.length ? s[s.length >> 1] : 0; }
+function pct(g: number, att: number): number | null { return g + att ? Math.round(100 * g / (g + att)) : null; }
+
+/** true = scheduled that weekday, false = explicitly not scheduled, null = no schedule known. */
+function sched(M: Model, a: number, i: number, d: number): boolean | null {
+  const s = M.sch[M.acc[a]];
+  if (!s) return null;
+  const t = s[M.typ[i]];
+  return t === undefined || t === null ? null : t.charAt(d % 7) === "1";
+}
+
+/**
+ * State of one feed (account × interface × day):
+ *   g    fully reconciled  — a row exists and |variance| <= 0.5
+ *   att  not fully reconciled (t = tracked via ticket)
+ *   miss scheduled, no row, and no explanatory comment
+ *   null not applicable
+ */
+function cell(M: Model, a: number, i: number, d: number): CellState | null {
+  const k = (a * M.NI + i) * KEY + d, r = M.F.get(k), s = sched(M, a, i, d);
+  if (r) {
+    const v = r[7];
+    if (v !== null && Math.abs(v) > 0.5) return { s: "att", r, v: Math.abs(v), t: !!r[8] };
+    return s === false ? null : { s: "g", r, v: 0, t: false };
+  }
+  if (s === true && !M.X.has(k)) return { s: "miss", r: null, v: 0, t: false };
+  return null;
+}
+
+function bucket(): Bucket { return { g: 0, att: 0, attT: 0, attN: 0, miss: 0, sum: 0, scope: 0, rec: 0, ld: 0, err: 0, pend: 0, top: "", topv: 0, missI: [], an: 0 }; }
+
+/** Aggregates days d1..d2 for one account (a0) / interface (i0), or all when -1. lite skips lists and anomalies. */
+function scan(M: Model, d1: number, d2: number, a0: number, i0: number, lite: boolean): Scan {
+  const o: Scan = { g: 0, att: 0, attT: 0, attN: 0, miss: 0, sum: 0, scope: 0, rate: null, items: [], missL: [], anom: [], byI: M.ifs.map(() => bucket()), byA: M.acc.map(() => bucket()) };
+  for (let d = d1; d <= d2; d++) for (let a = 0; a < M.NA; a++) {
+    if (a0 >= 0 && a !== a0) continue;
+    for (let i = 0; i < M.NI; i++) {
+      if (i0 >= 0 && i !== i0) continue;
+      const A = o.byA[a], B = o.byI[i];
+      if (sched(M, a, i, d) === true) { o.scope++; A.scope++; B.scope++; }
+      const c = cell(M, a, i, d);
+      if (!c) continue;
+      if (c.r) { B.rec += c.r[3]; B.ld += c.r[4]; B.err += c.r[5]; B.pend += c.r[6]; }
+      if (c.s === "g") { o.g++; A.g++; B.g++; }
+      else if (c.s === "att") {
+        o.att++; A.att++; B.att++; B.sum += c.v; A.sum += c.v; o.sum += c.v;
+        if (c.t) { o.attT++; A.attT++; B.attT++; } else { o.attN++; A.attN++; B.attN++; }
+        if (!lite) o.items.push({ a, i, d, v: c.v, t: c.t });
+        if (c.v > A.topv) { A.topv = c.v; A.top = M.ifs[i] + " (" + md(M, d) + ")"; }
+      } else {
+        o.miss++; A.miss++; B.miss++;
+        if (A.missI.length < 3 && A.missI.indexOf(M.ifs[i]) < 0) A.missI.push(M.ifs[i]);
+        if (!lite) o.missL.push({ a, i, d });
+      }
+      // volume anomaly: received vs median of the previous (up to 20) reported days in the last 45
+      if (!lite && c.r && c.r[3] > 0) {
+        const base: number[] = [];
+        for (let e = d - 1; e >= Math.max(0, d - 45) && base.length < 20; e--) {
+          const q = M.F.get((a * M.NI + i) * KEY + e);
+          if (q && q[3] > 0) base.push(q[3]);
+        }
+        if (base.length >= 6) {
+          const m = median(base), v = c.r[3];
+          if (m >= M.anomMin && (v > M.anomFactor * m || (v < m / M.anomFactor && d < M.LAST))) { o.anom.push({ a, i, d, v, m, dev: Math.abs(v - m) }); A.an++; }
+        }
+      }
+    }
+  }
+  o.items.sort((p, q) => Math.abs(q.v) - Math.abs(p.v));
+  o.anom.sort((p, q) => q.dev - p.dev);
+  o.rate = pct(o.g, o.att);
+  return o;
+}
+
+function monthList(M: Model): number[][] {
+  const out: number[][] = [];
+  const a = new Date(M.T0 * MS_DAY), b = new Date((M.T0 + M.LAST) * MS_DAY);
+  let y = a.getUTCFullYear(), m = a.getUTCMonth();
+  while (y < b.getUTCFullYear() || (y === b.getUTCFullYear() && m <= b.getUTCMonth())) { out.push([y, m]); m++; if (m > 11) { m = 0; y++; } }
+  return out;
+}
+
+function groupBy(items: Item[], key: (x: Item) => string, numeric: boolean): Group[] {
+  const g = new Map<string, Group>();
+  items.forEach(x => {
+    const k = key(x);
+    let z = g.get(k);
+    if (!z) { z = { k, n: 0, sum: 0, x }; g.set(k, z); }
+    z.n++; z.sum += Math.abs(x.v);
+  });
+  const out: Group[] = []; g.forEach(z => out.push(z));
+  if (numeric) out.sort((p, q) => (+p.k) - (+q.k));
+  return out;
+}
+
+/** "Highlights" panel: up to four sentences for a day (d), week (w) or month (m). HTML with <b>. */
+function findings(M: Model, V: string, d1: number, d2: number, a0: number, o: Scan, months: number[][], mo: number): string[] {
+  const out: string[] = [];
+  const all = a0 < 0;
+  const name = (k: string): string => esc(all ? M.acc[+k] : M.ifs[+k]);
+  const by = (x: Item): string => String(all ? x.a : x.i);
+  let pr: Scan | null = null;
+  if (V === "d") pr = scan(M, Math.max(0, d1 - 1), Math.max(0, d1 - 1), a0, -1, true);
+  else if (V === "w") pr = scan(M, Math.max(0, d1 - 7), Math.max(0, d1 - 1), a0, -1, true);
+  else if (mo > 0) pr = scan(M, Math.max(0, dayIdx(M, months[mo - 1][0], months[mo - 1][1], 1)), dayIdx(M, months[mo - 1][0], months[mo - 1][1] + 1, 0), a0, -1, true);
+  const vs = (lbl: string): void => {
+    if (!pr) return;
+    const a = pct(o.g, o.att), b = pct(pr.g, pr.att);
+    if (a === null || b === null) return;
+    out.push("Reconciled rate <b>" + a + "%</b> vs " + b + "% in the " + lbl + " (" + (a > b ? "▲ better" : a < b ? "▼ worse" : "unchanged") + "); not fully reconciled " + o.att + " vs " + pr.att + ", not reported " + o.miss + " vs " + pr.miss + ".");
+  };
+  if (V === "d") {
+    const t = o.items[0];
+    if (t) out.push("Biggest variance today: <b>" + (all ? esc(M.acc[t.a]) + " · " : "") + esc(M.ifs[t.i]) + "</b> (" + full(t.v) + "), " + (t.t ? "tracked via a ticket" : "<b>no ticket</b>") + ".");
+    const un = groupBy(o.items.filter(x => !x.t), by, true).sort((p, q) => q.n - p.n);
+    if (o.attN) out.push("<b>" + o.attN + "</b> variance" + (o.attN > 1 ? "s" : "") + " need a ticket today" + (un.length ? " — " + un.slice(0, 3).map(z => name(z.k) + " (" + z.n + ")").join(", ") : "") + ".");
+    else if (o.att) out.push("Every variance today is tracked via a ticket.");
+    if (o.miss) {
+      const ms = new Set<number>(o.missL.map(x => x.a)).size;
+      out.push("<b>" + o.miss + "</b> scheduled feed" + (o.miss > 1 ? "s" : "") + " not reported today" + (all ? " across " + ms + " customer" + (ms > 1 ? "s" : "") : "") +
+        " (e.g. " + o.missL.slice(0, 2).map(x => (all ? esc(M.acc[x.a]) + " · " : "") + esc(M.ifs[x.i])).join(", ") + ").");
+    }
+    if (o.anom.length) { const x = o.anom[0]; out.push("Volume check: " + (all ? "<b>" + esc(M.acc[x.a]) + "</b> · " : "") + esc(M.ifs[x.i]) + " received " + full(x.v) + " vs usual ~" + full(x.m) + "."); }
+    vs("previous day");
+  } else if (V === "w") {
+    const g = groupBy(o.items, by, true).sort((p, q) => q.sum - p.sum);
+    if (g.length && o.sum) out.push("<b>" + name(g[0].k) + "</b> accounts for " + Math.round(100 * g[0].sum / o.sum) + "% of the week’s variance (Σ|variance| " + full(g[0].sum) + ").");
+    const rp = groupBy(o.items, x => x.a + "|" + x.i, false).filter(z => z.n >= 2).sort((p, q) => q.n - p.n);
+    if (rp.length) out.push("<b>" + rp.length + "</b> feed" + (rp.length > 1 ? "s are" : " is") + " not reconciled on 2+ days this week; longest: " + (all ? esc(M.acc[rp[0].x.a]) + " · " : "") + esc(M.ifs[rp[0].x.i]) + " (" + rp[0].n + " days).");
+    let bi = 0;
+    const R: Scan[] = [];
+    for (let d = d1; d <= d2; d++) R.push(scan(M, d, d, a0, -1, true));
+    R.forEach((x, i) => { if (d1 + i <= M.DEF && x.att + x.miss > R[bi].att + R[bi].miss) bi = i; });
+    if (R.length) out.push("Worst day: <b>" + DOW[(d1 + bi) % 7] + " " + md(M, d1 + bi) + "</b> with " + R[bi].att + " not fully reconciled and " + R[bi].miss + " not reported.");
+    vs("previous week");
+  } else {
+    vs("previous month");
+    const wk = new Map<number, number>();
+    o.items.forEach(x => { const k = Math.floor(x.d / 7) * 7; wk.set(k, (wk.get(k) || 0) + Math.abs(x.v)); });
+    const wl: number[][] = []; wk.forEach((s, k) => wl.push([k, s]));
+    wl.sort((p, q) => p[0] - q[0]).sort((p, q) => q[1] - p[1]);
+    if (wl.length) out.push("Heaviest week: <b>week of " + md(M, wl[0][0]) + "</b> (Σ|variance| " + full(wl[0][1]) + ").");
+    const g = groupBy(o.items, by, true).sort((p, q) => q.n - p.n);
+    if (g.length) out.push("Most days not reconciled: <b>" + name(g[0].k) + "</b> (" + g[0].n + " feed-days).");
+    if (o.att) out.push("Ticket coverage: <b>" + Math.round(100 * o.attT / o.att) + "%</b> of variances this month are tracked via a ticket" + (pr && pr.att ? " (previous month " + Math.round(100 * pr.attT / pr.att) + "%)" : "") + ".");
+  }
+  return out.slice(0, 4);
+}
+
+/* ======================= output shaping ======================= */
+
+function tiles(o: Scan): Tiles {
+  return { inScope: o.scope, fullyReconciled: o.g, notFullyReconciled: o.att, trackedViaTicket: o.attT, notTrackedViaTicket: o.attN, notReported: o.miss, varianceSum: o.sum, reconciledRate: o.rate === null ? -1 : o.rate };
+}
+
+function section(M: Model, label: string, d1: number, d2: number, o: Scan, hl: string[]) {
+  const day = (d: number): string => DOW[d % 7] + " " + md(M, d);
+  return {
+    label, from: iso(M, d1), to: iso(M, d2), tiles: tiles(o),
+    highlights: hl.map(h => h.replace(/<\/?b>/g, "")), highlightsHtml: hl,
+    customers: o.byA.map((x, a) => ({ a, x })).filter(z => z.x.g + z.x.att + z.x.miss + z.x.scope > 0)
+      .sort((p, q) => q.x.sum - p.x.sum || q.x.miss - p.x.miss)
+      .map(z => ({ customer: M.acc[z.a], inScope: z.x.scope, fullyReconciled: z.x.g, notFullyReconciled: z.x.att, trackedViaTicket: z.x.attT, notTrackedViaTicket: z.x.attN, notReported: z.x.miss, varianceSum: z.x.sum, reconciledRate: pct(z.x.g, z.x.att), topVariance: z.x.top, volumeAnomalies: z.x.an })),
+    interfaces: o.byI.map((b, i) => ({ i, b })).filter(z => z.b.scope > 0 || z.b.g + z.b.att + z.b.miss > 0 || z.b.rec !== 0)
+      .sort((p, q) => q.b.sum - p.b.sum || q.b.miss - p.b.miss || q.b.scope - p.b.scope)
+      .map(z => ({ interface: M.ifs[z.i], inScope: z.b.scope, received: z.b.rec, loaded: z.b.ld, error: z.b.err, pending: z.b.pend, varianceSum: z.b.sum, fullyReconciled: z.b.g, trackedViaTicket: z.b.attT, notTrackedViaTicket: z.b.attN, notReported: z.b.miss })),
+    topVariances: o.items.slice(0, 12).map(x => ({ customer: M.acc[x.a], interface: M.ifs[x.i], date: iso(M, x.d), day: day(x.d), variance: x.v, ticket: x.t })),
+    varianceCount: o.items.length,
+    notReported: o.missL.slice().sort((p, q) => q.d - p.d || p.a - q.a).slice(0, 200).map(x => ({ customer: M.acc[x.a], interface: M.ifs[x.i], date: iso(M, x.d), day: day(x.d) })),
+    volumeAnomalies: o.anom.slice(0, 15).map(x => ({ customer: M.acc[x.a], interface: M.ifs[x.i], date: iso(M, x.d), day: day(x.d), received: x.v, usual: x.m, changePct: Math.round((x.v - x.m) / x.m * 100) }))
+  };
+}
+
+/** Historical view: weekly scorecard per customer, recurring issues, quality over time. */
+function history(M: Model) {
+  const weeks: number[] = [];
+  for (let w = 0; w * 7 <= M.LAST; w++) weeks.push(w * 7);
+  const wEnd = (w: number): number => Math.min(M.LAST, w + 6);
+  const avg = (a: number[]): number => a.reduce((x, y) => x + y, 0) / a.length;
+  const notNull = (v: number | null): boolean => v !== null;
+  const scorecard: { customer: string; rates: (number | null)[]; last4VsPrior4: number | null }[] = [];
+  M.acc.forEach((n, a) => {
+    const rs = weeks.map(w => { const x = scan(M, w, wEnd(w), a, -1, true); return pct(x.g, x.att); });
+    if (!rs.some(notNull)) return;
+    const rec: number[] = [], old: number[] = [];
+    rs.slice(-4).forEach(v => { if (v !== null) rec.push(v); });
+    rs.slice(-8, -4).forEach(v => { if (v !== null) old.push(v); });
+    scorecard.push({ customer: n, rates: rs, last4VsPrior4: rec.length && old.length ? Math.round(avg(rec) - avg(old)) : null });
+  });
+  const pr = new Map<string, Rec>();
+  for (let d = 0; d <= M.LAST; d++) for (let a = 0; a < M.NA; a++) for (let i = 0; i < M.NI; i++) {
+    const c = cell(M, a, i, d);
+    if (!c || c.s !== "att") continue;
+    const k = a + "|" + i;
+    let p = pr.get(k);
+    if (!p) { p = { a, i, wk: new Set<number>(), n: 0, sum: 0, t: 0, last: 0, str: 0, cur: 0, prev: -9 }; pr.set(k, p); }
+    p.wk.add(Math.floor(d / 7)); p.n++; p.sum += c.v; if (c.t) p.t++;
+    p.last = d; p.cur = d - p.prev <= 1 ? p.cur + 1 : 1; p.str = Math.max(p.str, p.cur); p.prev = d;
+  }
+  const recs: Rec[] = []; pr.forEach(p => recs.push(p));
+  recs.sort((p, q) => q.wk.size - p.wk.size || q.sum - p.sum);
+  const W = weeks.map(w => scan(M, w, wEnd(w), -1, -1, true));
+  return {
+    weeks: weeks.map(w => iso(M, w)),
+    scorecard,
+    recurringIssues: recs.slice(0, 12).map(p => ({ customer: M.acc[p.a], interface: M.ifs[p.i], weeksAffected: p.wk.size, days: p.n, longestRunDays: p.str, varianceSum: p.sum, ticketedPct: Math.round(100 * p.t / p.n), lastSeen: iso(M, p.last) })),
+    quality: W.map((x, k) => {
+      const t = x.g + x.att + x.miss;
+      return { week: iso(M, weeks[k]), reconciledRate: pct(x.g, x.att), ticketCoverage: x.att ? Math.round(100 * x.attT / x.att) : null, scheduleAdherence: t ? Math.round(100 * (1 - x.miss / t)) : null };
+    })
+  };
+}
+
+function emailHtml(M: Model, dLabel: string, oD: Scan, hD: string[], wLabel: string, oW: Scan, url: string): string {
+  const td = "padding:6px 10px;border-bottom:1px solid #e1e7ee;font:13px Segoe UI,Arial,sans-serif;";
+  const th = td + "color:#5b6578;font-size:11px;text-transform:uppercase;text-align:left;";
+  const kpi = (l: string, n: string, c: string): string => "<td style=\"padding:10px 14px;border:1px solid #e1e7ee;border-top:3px solid " + c + ";text-align:center;font-family:Segoe UI,Arial,sans-serif\"><div style=\"font-size:11px;color:#5b6578;text-transform:uppercase\">" + l + "</div><div style=\"font-size:26px;font-weight:600;color:" + c + "\">" + n + "</div></td>";
+  const row = (o: Scan): string => "<table cellspacing=\"0\" cellpadding=\"0\" style=\"border-collapse:collapse;margin:8px 0 14px\"><tr>" +
+    kpi("In scope", String(o.scope), "#161d3f") + kpi("Fully reconciled", String(o.g), "#1e9e6a") + kpi("Not fully reconciled", String(o.att), "#c77700") +
+    kpi("Tracked via ticket", String(o.attT), "#2f6fed") + kpi("Not tracked", String(o.attN), "#c2410c") + kpi("Not reported", String(o.miss), "#c73a3a") +
+    kpi("Reconciled rate", o.rate === null ? "–" : o.rate + "%", "#1e9e6a") + "</tr></table>";
+  let h = "<div style=\"font-family:Segoe UI,Arial,sans-serif;color:#1c2433;font-size:14px\">" +
+    "<div style=\"background:#161d3f;color:#fff;padding:14px 18px;border-radius:8px\"><div style=\"font-size:11px;letter-spacing:.1em;color:#6fd9d4\">TECHNOLOGY OPERATIONS · RECONCILIATION REPORT</div><div style=\"font-size:20px;font-weight:600\">All customers · " + esc(dLabel) + "</div></div>" + row(oD);
+  if (hD.length) h += "<div style=\"font-weight:600;margin:4px 0\">Highlights</div><ol style=\"margin:4px 0 12px;padding-left:20px\">" + hD.map(x => "<li style=\"margin:3px 0\">" + x + "</li>").join("") + "</ol>";
+  if (oD.items.length) h += "<div style=\"font-weight:600;margin:4px 0\">Highest variances</div><table cellspacing=\"0\" style=\"border-collapse:collapse\"><tr><th style=\"" + th + "\">Customer</th><th style=\"" + th + "\">Interface</th><th style=\"" + th + "text-align:right\">Variance</th><th style=\"" + th + "\">Ticket</th></tr>" +
+    oD.items.slice(0, 10).map(x => "<tr><td style=\"" + td + "\"><b>" + esc(M.acc[x.a]) + "</b></td><td style=\"" + td + "\">" + esc(M.ifs[x.i]) + "</td><td style=\"" + td + "text-align:right\"><b>" + full(x.v) + "</b></td><td style=\"" + td + "color:" + (x.t ? "#2f6fed" : "#c2410c") + "\">" + (x.t ? "tracked" : "not tracked") + "</td></tr>").join("") + "</table>";
+  if (oD.missL.length) h += "<div style=\"font-weight:600;margin:12px 0 4px\">Scheduled but not reported (" + oD.miss + ")</div><table cellspacing=\"0\" style=\"border-collapse:collapse\">" +
+    oD.missL.slice(0, 20).map(x => "<tr><td style=\"" + td + "\"><b>" + esc(M.acc[x.a]) + "</b></td><td style=\"" + td + "\">" + esc(M.ifs[x.i]) + "</td></tr>").join("") + "</table>";
+  h += "<div style=\"font-weight:600;margin:14px 0 0\">" + esc(wLabel) + "</div>" + row(oW);
+  if (url) h += "<p><a href=\"" + esc(url) + "\" style=\"color:#1fb5ad;font-weight:600\">Open the Reconciliation Monitor</a></p>";
+  return h + "<div style=\"color:#5b6578;font-size:12px\">Data loaded through " + md(M, M.LAST) + " · generated by Power Automate.</div></div>";
+}

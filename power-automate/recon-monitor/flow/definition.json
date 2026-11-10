@@ -1,0 +1,174 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "name": "Reconciliation Monitor – refresh",
+    "note": "Reference definition (what 'Peek code' shows for each step once the flow is built). Values in CAPITALS are tenant-specific: pick them in the designer. See ../README.md for the click-by-click build."
+  },
+  "parameters": {
+    "$connections": { "defaultValue": {}, "type": "Object" },
+    "$authentication": { "defaultValue": {}, "type": "SecureObject" }
+  },
+  "triggers": {
+    "Every_morning": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Day",
+        "interval": 1,
+        "timeZone": "Eastern Standard Time",
+        "schedule": { "hours": ["7"], "minutes": [15] }
+      }
+    }
+  },
+  "actions": {
+    "Settings": {
+      "type": "Compose",
+      "runAfter": {},
+      "inputs": {
+        "siteUrl": "https://TENANT.sharepoint.com/sites/TechOps",
+        "configPath": "/SiteAssets/ReconMonitor/recon-config.json",
+        "templatePath": "/SiteAssets/ReconMonitor/recon-monitor.template.html",
+        "outputFolder": "/sites/TechOps/SiteAssets/ReconMonitor",
+        "pageFile": "Reconciliation-Monitor.html",
+        "digestFile": "recon-digest.json",
+        "timeZone": "Eastern Standard Time",
+        "mailTo": "techops-recon@TENANT.com"
+      }
+    },
+    "Get_config": {
+      "type": "OpenApiConnection",
+      "runAfter": { "Settings": ["Succeeded"] },
+      "inputs": {
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+          "connectionName": "shared_sharepointonline",
+          "operationId": "GetFileContentByPath"
+        },
+        "parameters": {
+          "dataset": "@outputs('Settings')?['siteUrl']",
+          "path": "@outputs('Settings')?['configPath']",
+          "inferContentType": false
+        },
+        "authentication": "@parameters('$authentication')"
+      }
+    },
+    "Get_template": {
+      "type": "OpenApiConnection",
+      "runAfter": { "Settings": ["Succeeded"] },
+      "inputs": {
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+          "connectionName": "shared_sharepointonline",
+          "operationId": "GetFileContentByPath"
+        },
+        "parameters": {
+          "dataset": "@outputs('Settings')?['siteUrl']",
+          "path": "@outputs('Settings')?['templatePath']",
+          "inferContentType": false
+        },
+        "authentication": "@parameters('$authentication')"
+      }
+    },
+    "Run_script": {
+      "type": "OpenApiConnection",
+      "runAfter": { "Get_config": ["Succeeded"], "Get_template": ["Succeeded"] },
+      "inputs": {
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+          "connectionName": "shared_excelonlinebusiness",
+          "operationId": "RunScriptProd"
+        },
+        "parameters": {
+          "source": "SITE_HOLDING_THE_RECON_TRACKER",
+          "drive": "DOCUMENT_LIBRARY",
+          "file": "RECON_TRACKER_WORKBOOK.xlsx",
+          "scriptId": "ReconMonitor",
+          "ScriptParameters/configJson": "@{base64ToString(body('Get_config')?['$content'])}",
+          "ScriptParameters/asOf": "@{convertTimeZone(utcNow(), 'UTC', outputs('Settings')?['timeZone'], 'yyyy-MM-dd')}",
+          "ScriptParameters/mode": "build"
+        },
+        "authentication": "@parameters('$authentication')"
+      }
+    },
+    "If_nothing_was_read": {
+      "type": "If",
+      "runAfter": { "Run_script": ["Succeeded"] },
+      "expression": { "equals": ["@body('Run_script')?['result']?['ok']", false] },
+      "actions": {
+        "Stop_and_keep_the_last_good_page": {
+          "type": "Terminate",
+          "inputs": {
+            "runStatus": "Failed",
+            "runError": {
+              "code": "NoTrackerRows",
+              "message": "@{join(body('Run_script')?['result']?['warnings'], ' | ')}"
+            }
+          }
+        }
+      },
+      "else": { "actions": {} }
+    },
+    "Compose_page": {
+      "type": "Compose",
+      "runAfter": { "If_nothing_was_read": ["Succeeded"] },
+      "inputs": "@replace(base64ToString(body('Get_template')?['$content']), '\"__RECON_DATA__\"', body('Run_script')?['result']?['dataJson'])"
+    },
+    "Publish_page": {
+      "type": "OpenApiConnection",
+      "runAfter": { "Compose_page": ["Succeeded"] },
+      "inputs": {
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+          "connectionName": "shared_sharepointonline",
+          "operationId": "HttpRequest"
+        },
+        "parameters": {
+          "dataset": "@outputs('Settings')?['siteUrl']",
+          "parameters/method": "POST",
+          "parameters/uri": "_api/web/GetFolderByServerRelativeUrl('@{outputs('Settings')?['outputFolder']}')/Files/add(url='@{outputs('Settings')?['pageFile']}',overwrite=true)",
+          "parameters/headers": { "Accept": "application/json;odata=nometadata" },
+          "parameters/body": "@{outputs('Compose_page')}"
+        },
+        "authentication": "@parameters('$authentication')"
+      }
+    },
+    "Publish_digest": {
+      "type": "OpenApiConnection",
+      "runAfter": { "Compose_page": ["Succeeded"] },
+      "inputs": {
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+          "connectionName": "shared_sharepointonline",
+          "operationId": "HttpRequest"
+        },
+        "parameters": {
+          "dataset": "@outputs('Settings')?['siteUrl']",
+          "parameters/method": "POST",
+          "parameters/uri": "_api/web/GetFolderByServerRelativeUrl('@{outputs('Settings')?['outputFolder']}')/Files/add(url='@{outputs('Settings')?['digestFile']}',overwrite=true)",
+          "parameters/headers": { "Accept": "application/json;odata=nometadata" },
+          "parameters/body": "@{body('Run_script')?['result']?['digestJson']}"
+        },
+        "authentication": "@parameters('$authentication')"
+      }
+    },
+    "Send_daily_digest": {
+      "type": "OpenApiConnection",
+      "runAfter": { "Publish_page": ["Succeeded"] },
+      "inputs": {
+        "host": {
+          "apiId": "/providers/Microsoft.PowerApps/apis/shared_office365",
+          "connectionName": "shared_office365",
+          "operationId": "SendEmailV2"
+        },
+        "parameters": {
+          "emailMessage/To": "@outputs('Settings')?['mailTo']",
+          "emailMessage/Subject": "@body('Run_script')?['result']?['subject']",
+          "emailMessage/Body": "@{body('Run_script')?['result']?['emailHtml']}@{if(empty(body('Run_script')?['result']?['warnings']), '', concat('<p style=\"color:#c77700;font:12px Segoe UI,Arial\"><b>Tracker warnings</b><br>', join(body('Run_script')?['result']?['warnings'], '<br>'), '</p>'))}",
+          "emailMessage/Importance": "@if(body('Run_script')?['result']?['needsAttention'], 'High', 'Normal')"
+        },
+        "authentication": "@parameters('$authentication')"
+      }
+    }
+  },
+  "outputs": {}
+}

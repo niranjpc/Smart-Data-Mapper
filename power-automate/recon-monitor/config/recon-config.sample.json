@@ -1,0 +1,53 @@
+{
+  "startDate": "2026-06-29",
+  "homeUrl": "https://contoso.sharepoint.com/sites/TechOps/SitePages/Home.aspx",
+  "dashboardUrl": "https://contoso.sharepoint.com/sites/TechOps/SiteAssets/ReconMonitor/Reconciliation-Monitor.html",
+  "dateOrder": "MDY",
+  "minRowsForDefaultDay": 100,
+  "scheduleSheet": "Recon Report Schedule",
+  "unmappedAccounts": "keep",
+  "varianceWhenMissing": "none",
+  "explainedCommentPattern": "\\b(n\\/?a|not applicable|no run|no file|holiday|on hold)\\b",
+  "anomalyMinMedian": 200,
+  "anomalyFactor": 3,
+  "accountAliases": {
+    "Plan A": "Plan A Health",
+    "Plan B - East": "Plan B",
+    "Plan B - West": "Plan B",
+    "Plan B (state not given)": "Plan B"
+  },
+  "ignoreAccounts": ["Retired Plan"],
+  "columns": {
+    "date": ["^date$", "run date", "recon date", "report date"],
+    "account": ["^account", "customer", "client"],
+    "received": ["received"],
+    "loaded": ["loaded"],
+    "error": ["error"],
+    "pending": ["pending", "work ?basket", "\\bwb\\b"],
+    "variance": ["variance", "difference"],
+    "ticket": ["ticket", "jira", "incident"],
+    "comment": ["comment", "remark"]
+  },
+  "interfaces": [
+    { "name": "Enrollment IB" },
+    { "name": "Claims Clearing House" },
+    { "name": "Claims IB", "columns": { "received": ["paper", "\\bedi\\b"], "error": ["edifecs", "i-?plus"] } },
+    { "name": "Provider IB – Tax entity", "scheduleType": "Provider IB" },
+    { "name": "Provider IB – Practitioner", "scheduleType": "Provider IB" },
+    { "name": "Provider IB – Supplier", "scheduleType": "Provider IB" },
+    { "name": "Provider IB – Supplier Location", "scheduleType": "Provider IB" },
+    { "name": "Provider IB – Practitioner Role", "scheduleType": "Provider IB" },
+    { "name": "Authorization IB" },
+    { "name": "Accumulator IB" },
+    { "name": "ID Cards-Extract", "columns": { "received": ["triggered"], "loaded": ["extracted"] } },
+    { "name": "ID Cards-Acknowledgement" },
+    { "name": "Correspondences- Extract", "columns": { "received": ["triggered"], "loaded": ["extracted"] } },
+    { "name": "Member Packets-Extract", "columns": { "received": ["triggered"], "loaded": ["extracted"] } },
+    { "name": "Member Packets-Acknowledgement" },
+    { "name": "Claims Payment Extract", "columns": { "received": ["triggered"], "loaded": ["extracted"] } },
+    { "name": "External Pricing" },
+    { "name": "External Claims Editing" },
+    { "name": "Encounter Submission" },
+    { "name": "Encounter Rejections", "scheduleType": "Encounter Submission" }
+  ]
+}
