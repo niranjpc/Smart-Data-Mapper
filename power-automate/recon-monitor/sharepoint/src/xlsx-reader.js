@@ -45,7 +45,7 @@ async function readXlsx(buffer) {
       const t = attr(a, 't'), vm = /<v\b[^>]*>([\s\S]*?)<\/v>/.exec(inner);
       let v = '';
       if (t === 'inlineStr') v = runs(inner);
-      else if (!vm) return m;
+      else if (!vm || vm[1] === '') return m; /* formula without a stored result = blank */
       else if (t === 's') v = shared[+vm[1]] === undefined ? '' : shared[+vm[1]];
       else if (t === 'b') v = vm[1] === '1';
       else if (t === 'str' || t === 'e') v = unesc(vm[1]);

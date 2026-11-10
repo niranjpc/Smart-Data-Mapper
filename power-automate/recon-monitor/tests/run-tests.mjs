@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { ROOT, loadScript, mockWorkbook, serial, addDays } from './harness.mjs';
+import { ROOT, loadScript, mockWorkbook, datasetToWorkbook, serial, addDays } from './harness.mjs';
 
 const os = loadScript();
 let n = 0;
@@ -91,6 +91,63 @@ test('sample config parses and the template still holds its placeholder', () => 
   assert.equal(c.interfaces.length, 20);
   const t = readFileSync(path.join(ROOT, 'dashboard/recon-monitor.template.html'), 'utf8');
   assert.equal(t.split('"__RECON_DATA__"').length, 2);
+});
+
+// ---- the real report layout (default configuration) ----
+test('header formulas', () => {
+  const v = { A: 10, B: 2, C: 3, D: 4, E: 1 };
+  const f = (e) => os.evalFormula(e, (L) => (L in v ? v[L] : null));
+  assert.equal(f('A-(B+C+D+E)'), 0); assert.equal(f('(A + B) - (C+D+E)'), 4); assert.equal(f('B-(D+E)'), -3);
+  assert.equal(f('A-(B+Z)'), null); assert.equal(f('A-(B'), null); assert.equal(f(''), null);
+});
+
+test('report layout: lettered headers, template rows, empty days, blank variance, two ticket columns', () => {
+  const T = ['', '', '', 'Transaction Counts'];
+  const H = ['Account', 'Date', 'File Name', 'Received\n(A)', 'EDIFECS Errors\n(B)', 'I-Plus Errors\n(C)', 'Workbasket\n(D)', 'Loaded into HRP\n(E)', 'Variance\nA-(B+C+D+E)', 'Jira Ticket Number\n\n(to resolve Errors)', 'Jira Ticket Number\n\n(to investigate transaction variance)', 'Comments '];
+  const C = ['Account ', 'Date', 'System', 'Received - Paper\n(A)', 'Received - EDI\n(B)', 'EDIFECS Error\n( C )', 'I-Plus Errors\n(D)', 'Loaded into HRP\n( E )\n\nE = F+G+I', 'Finalized\n(F)', 'Denied\n(G)', 'Workbasket\n(I) \nI = J + K', 'Need Repair \n(J)', 'Need Review\n(K)', 'Variance\n\n(A + B) - (C+D+E)', 'Jira Ticket Number\n(to resolve Errors', 'Comments'];
+  const sheets = {
+    'Enrollment IB': [['', 'Back'], ['', 'Load Summary Report'], T, H,
+      ['PlanOne', '', 'MD', '', '', '', '', '', 0, '', '', ''],                 // template row without a date: ignored
+      ['PlanOne', day(0), 'f1', 100, 5, 0, 0, 95, '', '', '', ''],              // variance blank -> header formula -> 0
+      ['Planone ', day(0), 'f2', 50, 0, 0, 0, 40, '', 'ERR-1', '', ''],         // second file same day: summed, 10 short, ticket
+      ['Plan Two', day(0), 'No file for the day', '', '', '', '', '', 0, '', '', ''], // explained
+      ['PlanTwo', day(1), '', '', '', '', '', '', 0, '', '', ''],            // dated but nothing entered: not reported
+      ['Planone', day(1), 'f', 7, 0, 0, 0, 7, 3, '', '', '']],                  // a stored variance wins over the formula
+    'Claims IB': [['', 'Back'], T, C,
+      ['Planone', day(0), 'SDS', 10, 90, 2, 3, '', 70, 20, '', 4, 1, '', '', '']], // E and I blank -> derived: I=5, E=95, variance 0
+    'Recon Report Schedule': [['Recon Report Schedule — Weekly Calendar (by Account)'], ['Account', 'Reconciliation Type', 'Report Type', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun', 'Monthly', 'Notes'],
+      ['Planone', 'Transactional Integrity', 'Enrollment IB', 'X', 'X', 'X', 'X', 'X', ' ', ' ', ' ', ''], ['', '', 'Claims IB', 'X', ' ', '', '', '', '', '', '', ''], ['', '', 'TM Aging Summary', 'X', 'X', 'X', 'X', 'X', '', '', '', ''],
+      ['PlanTwo', 'Transactional Integrity', 'Enrollment IB', 'X', 'X', '', '', '', '', '', 'Monthly', '']],
+  };
+  const { r, data } = run(sheets, { interfaces: undefined, accountAliases: { Planone: 'Plan One Health' } }, addDays(START, 1));
+  const w = r.warnings.filter((x) => !/not found|accountAliases/.test(x));
+  assert.deepEqual(w, []);
+  const med = data.acc.indexOf('Plan One Health'), zing = data.acc.indexOf('Plan Two'); // first spelling seen names the account; 'PlanTwo' joins it
+  assert.equal(data.acc.length, 2);
+  const f = Object.fromEntries(data.f.map((x) => [x.slice(0, 3).join('|'), x.slice(3)]));
+  assert.deepEqual(f[`0|${med}|0`], [150, 135, 5, 0, 10, 1]);
+  assert.deepEqual(f[`1|${med}|0`], [7, 7, 0, 0, 3, 0]);
+  assert.deepEqual(f[`0|${med}|2`], [100, 95, 5, 5, 0, 0]);
+  assert.equal(data.f.length, 3);
+  assert.deepEqual(data.x, [[0, zing, 0]]);
+  assert.deepEqual(data.sch, { 'Plan One Health': { 'Enrollment IB': '1111100', 'Claims IB': '1000000' }, 'Plan Two': { 'Enrollment IB': '1100000' } });
+  assert.deepEqual(r.weekly, { inScope: 5, fullyReconciled: 1, notFullyReconciled: 2, trackedViaTicket: 1, notTrackedViaTicket: 1, notReported: 1, varianceSum: 13, reconciledRate: 33 });
+});
+
+test('stacked tables and several workbooks round-trip', () => {
+  const ifs = ['Enrollment IB', 'Provider IB – Tax entity', 'Provider IB – Practitioner', 'Provider IB – Supplier', 'Encounter Submission', 'Encounter Rejections'];
+  const D = { start: START, acc: ['Plan A', 'Plan B'], ifs, f: [], x: [[2, 1, 4], [3, 0, 5]],
+    sch: { 'Plan A': { 'Enrollment IB': '1111111', 'Provider IB': '1111100', 'Encounter Submission': '0100000' }, 'Plan B': { 'Enrollment IB': '1111100', 'Provider IB': '0000000', 'Encounter Submission': '1000001' } } };
+  for (let d = 0; d < 12; d++) for (let a = 0; a < 2; a++) for (let i = 0; i < ifs.length; i++) if ((d + a + i) % 3) D.f.push([d, a, i, 100 + d + i, 90 + d, 4, 6 + i, (d * i) % 4 ? 0 : i + 1, (d + i) % 2]);
+  const wb = (from, to) => mockWorkbook(datasetToWorkbook({ ...D, f: D.f.filter((r) => r[0] >= from && r[0] <= to), x: D.x.filter((r) => r[0] >= from && r[0] <= to) }));
+  const two = { getWorksheets: () => wb(0, 6).getWorksheets().concat(wb(7, 11).getWorksheets()) };   // archived week + current week
+  const r = os.main(two, JSON.stringify({ startDate: START, accountAliases: { 'Plan A': 'Plan A', 'Plan B': 'Plan B' } }), addDays(START, 11));
+  assert.deepEqual(r.warnings.filter((x) => !/not found|accountAliases|no table with a date column/.test(x)), []); // the made-up tracker has 6 of the 20 interfaces
+  const data = JSON.parse(r.dataJson), key = (x) => x.slice(0, 3).join('|');
+  const remap = (x) => [x[0], data.acc.indexOf(D.acc[x[1]]), data.ifs.indexOf(ifs[x[2]]), ...x.slice(3)];
+  assert.deepEqual(Object.fromEntries(data.f.map((x) => [key(x), x])), Object.fromEntries(D.f.map(remap).map((x) => [key(x), x])));
+  assert.deepEqual(data.x.map(key).sort(), D.x.map(remap).map(key).sort());
+  assert.deepEqual(data.sch, D.sch);
 });
 
 // ---- SharePoint live page: built-in .xlsx reader + generated page ----

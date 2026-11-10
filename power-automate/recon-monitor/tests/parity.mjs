@@ -20,7 +20,8 @@ raw.x = JSON.parse(line.slice(cut + 5).replace(/;\s*$/, ''));
 const NM = new Function('return ' + /const NM=(\{.*?\});/.exec(body)[1])();
 
 const os = loadScript();
-const config = { startDate: raw.start, accountAliases: NM, ignoreAccounts: raw.acc.filter((n) => NM[n] === undefined) };
+// the original data has rows without a variance value; keep them blank instead of deriving one from the header formula
+const config = { startDate: raw.start, accountAliases: NM, ignoreAccounts: raw.acc.filter((n) => NM[n] === undefined), varianceWhenMissing: 'none' };
 const res = os.main(mockWorkbook(datasetToWorkbook(raw)), JSON.stringify(config), raw.asOf);
 assert.deepEqual(res.warnings, [], 'script warnings');
 const data = JSON.parse(res.dataJson);
@@ -30,7 +31,9 @@ const orig = runPage(body);                                       // original pa
 const tpl = runPage(scriptOf(readFileSync(path.join(ROOT, 'dashboard/recon-monitor.template.html'), 'utf8')).replace('"__RECON_DATA__"', () => res.dataJson));
 const M = modelOf(data, os.KEY);
 let checks = 0;
-const same = (a, b, msg) => { assert.deepEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b)), msg); checks++; };
+// compares canonical JSON (sorted keys); reports only the label, a full diff of 14k rows is useless
+const canon = (v) => JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((n) => [n, x[n]])) : x));
+const same = (a, b, msg) => { if (canon(a) !== canon(b)) throw new Error('MISMATCH: ' + msg + '\n  script  : ' + canon(a).slice(0, 300) + '\n  original: ' + canon(b).slice(0, 300)); checks++; };
 
 // ---- dataset ----
 same(data.acc, orig.ACC, 'accounts'); same(data.ifs, orig.IFS, 'interfaces'); same(data.sch, orig.D.sch, 'schedule');

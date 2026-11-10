@@ -50,7 +50,7 @@ Each **feed** is one customer × interface × day.
 | Volume anomaly | Received > 3× or < ⅓ of the median of the previous ≤ 20 reported days (last 45 days, ≥ 6 days of history, median ≥ 200); the latest day is only checked for spikes |
 | Name alignment | Tracker names are mapped through `accountAliases`; names that map to the same customer are merged (counts and \|variance\| summed, ticket kept if any row has one) |
 | Schedule type | `Provider IB – *` interfaces follow the `Provider IB` schedule, `Encounter Rejections` follows `Encounter Submission` |
-| Default day | Latest day with at least `minRowsForDefaultDay` rows, so a half-filled "today" does not become the headline |
+| Default day | Latest day with at least 60% of the busiest day's rows (or `minRowsForDefaultDay`), so a half-filled "today" does not become the headline |
 | Highlights | Day: biggest variance, variances needing a ticket, feeds not reported, volume check, vs previous day. Week: top contributor, feeds failing 2+ days, worst day, vs previous week. Month: vs previous month, heaviest week, most days not reconciled, ticket coverage |
 | History | Weekly reconciled rate per customer with last-4 vs prior-4 weeks, recurring issues (weeks affected, longest run, % ticketed), weekly quality (rate, ticket coverage, schedule adherence) |
 
@@ -62,9 +62,9 @@ viewer's sign-in, computes the dashboard in the browser and renders it. No data 
 
 1. Upload `sharepoint/Reconciliation-Monitor.aspx` and your `recon-config.json` to one folder of a
    document library (for example `SiteAssets/ReconMonitor`).
-2. In `recon-config.json` set `siteUrl` (site that holds the tracker), `trackerPath` (server-relative path
-   of the workbook, e.g. `/sites/TechOps/Shared Documents/Recon/Recon Tracker.xlsx`) and `timeZone`
-   (IANA name, used for "today").
+2. In `recon-config.json` set `siteUrl` (site that holds the report), `trackerPath` (server-relative path
+   of the current workbook), `archiveFolder` (folder with the archived weekly workbooks, optional) and
+   `timeZone` (IANA name, used for "today").
 3. Open `…/Reconciliation-Monitor.aspx?mode=inspect` — it lists the sheets and the columns matched per
    interface. Adjust the configuration (see the table under *Match the configuration to the tracker*).
 4. Open the page without parameters, then link or embed it the same way as the Batch Monitor page.
@@ -95,22 +95,44 @@ rename it **ReconMonitor**, save.
 
 ### 3. Match the configuration to the tracker
 
-The script expects one sheet per interface with a header row containing a date and an account column,
-plus a schedule tab. Run the script from Excel once with `mode` = `inspect` (leave the other
-parameters empty or paste your config): the `warnings` output lists, per interface, the sheet, header
-row and the columns it matched. Adjust `recon-config.json` until every interface reports the right columns.
+The built-in defaults match the Reconciliation Report workbook, so the configuration normally only needs
+the customer name mapping and the paths. How the workbook is read:
+
+- **Tables** — one sheet per interface; a table starts at the header row (the row with a `Variance` column).
+  `Provider IB` holds five stacked tables (Tax entity, Practitioner, Supplier, Supplier Location, Practitioner
+  Role) and `Encounter Submission` two (extraction, rejections); each is picked by the title above its header.
+- **Rows without a date are ignored** (pre-filled template rows). Dates are never filled down.
+- **A dated row with no counts entered is not a report**: the feed shows as *scheduled but not reported*,
+  unless the File Name / Comments text explains it (N/A, no file, no load, no run, holiday, on hold, out of scope).
+- Several rows for the same customer, interface and day (files, lines of business) are added up.
+- **Variance** is the value in the Variance column. If that cell is empty, it is calculated from the formula in
+  the header (`A-(B+C+D+E)`) using the lettered columns; totals defined in a header (`E = F+G+H+L+M+I`) are
+  derived the same way when blank.
+- **Tracked via ticket** = either Jira Ticket Number column is filled in.
+- Customer names ignore case, spacing and punctuation (`PlanOne` = `Planone`, `Plan Two` = `PlanTwo`).
+- **Schedule** — tab `Recon Report Schedule`: Account (merged cells), Report Type, an `X` per weekday. The
+  `Monthly` column and `TM Aging Summary` rows are not used.
+- Received / loaded / error / pending shown per interface come from: Received, Triggered, sent to print vendor,
+  eligible claims, payments inserted, sent to external vendor → *received*; Loaded into HRP, Extracted, status
+  received, submitted by clearing house, acknowledgement received, total payment sent → *loaded*; EDIFECS /
+  I-Plus errors, rejected by client, failed count, EDI rejections → *error*; Workbasket and pending columns → *pending*.
+
+Run with `mode` = `inspect` (or open the SharePoint page with `?mode=inspect`) to see, per interface, the
+sheet, header row and columns matched, and adjust `recon-config.json` if a sheet differs.
 
 | Setting | Meaning |
 |---|---|
 | `startDate` | First day of the archive (snapped back to a Monday) |
-| `interfaces[]` | `name` (as shown on the dashboard), optional `sheet` (default = name), `scheduleType`, `columns` overrides, `filterColumn` / `filterEquals` when several interfaces share one sheet |
+| `siteUrl`, `trackerPath`, `timeZone` | Live page: site and server-relative path of the current workbook; IANA time zone for "today" |
+| `archiveFolder`, `archivePattern` | Live page: folder with the archived weekly workbooks (every `.xlsx` in it is read, optionally filtered by a file-name pattern) so the history spans all weeks |
+| `interfaces[]` | Omit to use the built-in report layout. Otherwise `name` (as shown on the dashboard), optional `sheet` (default = name), `block` (title above the table when a sheet holds several), `scheduleType`, `columns` overrides, `variance` (formula to use when the Variance cell is empty, e.g. `A-(B+C)`), `filterColumn` / `filterEquals` |
 | `columns` | Header patterns per role (`date`, `account`, `received`, `loaded`, `error`, `pending`, `variance`, `ticket`, `comment`). Case-insensitive regular expressions. Count roles add up every matching column, e.g. Claims IB received = `paper` + `edi` |
 | `accountAliases` | Tracker name → dashboard name. Several tracker names may share one dashboard name |
 | `ignoreAccounts` | Tracker names to leave out |
 | `unmappedAccounts` | `keep` (default: show under the tracker name, with a warning) or `drop` |
-| `scheduleSheet` | Schedule tab. Layouts: Account + one column per interface type; Account, Interface, Mon…Sun; or Account, Interface, Schedule. Cells may read `Daily`, `Mon-Fri`, `Tue, Thu`, `N/A`, `Y`, or `1111100` |
+| `scheduleSheet`, `scheduleIgnoreTypes` | Schedule tab and report types on it that are not interfaces. Other layouts also work: Account + one column per interface type; or Account, Interface, Schedule (`Daily`, `Mon-Fri`, `Tue, Thu`, `N/A`) |
 | `explainedCommentPattern` | Comment text that explains a missing feed |
-| `varianceWhenMissing` | `none`, or `received-loaded-error-pending` for sheets without a variance column |
+| `varianceWhenMissing` | `formula` (default: use the header formula when the Variance cell is empty) or `none` |
 | `dateOrder` | `MDY` or `DMY` for dates stored as text |
 | `minRowsForDefaultDay`, `anomalyMinMedian`, `anomalyFactor` | Thresholds described above |
 | `homeUrl`, `dashboardUrl` | "TechOps home" button on the page; link in the e-mail |
@@ -168,4 +190,6 @@ the template rendered with the script's data.
   the name-alignment block is gone (the script does it), the preview banner became a "refreshed" stamp,
   and the per-feed key now allows archives longer than 400 days.
 - The built-in workbook reader handles standard `.xlsx` / `.xlsm` files; it does not read `.xlsb`, `.xls` or password-protected workbooks.
-- The schedule tab is applied to every week of the archive, as on the original dashboard.
+- The schedule tab of the current workbook is applied to every week of the archive, as on the original dashboard.
+- The flow's Office Script reads the one workbook it is run on (the current week); the live page also reads the archive folder.
+- `Claims Payment Extract` has no Variance column, so its reported rows count as reconciled.

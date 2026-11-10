@@ -83,30 +83,43 @@ const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 const DEFAULT_COLUMNS            = {
-  date: ["^date$", "run date", "recon date", "report date", "process(ed|ing)? date", "^day$"],
-  account: ["^account", "customer", "client", "health ?plan"],
-  received: ["received", "triggered"],
-  loaded: ["loaded", "extracted"],
-  error: ["error", "rejected"],
-  pending: ["pending", "work ?basket", "\\bwb\\b"],
-  variance: ["variance", "difference"],
-  ticket: ["ticket", "jira", "incident"],
-  comment: ["comment", "remark", "notes?$"]
+  date: ["^date$", "^run date$"],
+  account: ["^account", "^customer", "^client"],
+  received: ["^received", "^triggered", "sent to print vendor", "^eligible claims", "^payments inserted", "^sent to external"],
+  loaded: ["^loaded", "^extracted", "status received from print vendor", "^submitted by clearing house", "^ack\\w*ment received", "^total payment sent"],
+  error: ["error", "^rejected by client", "^failed count", "rejections in edi"],
+  pending: ["pending", "^work ?basket"],
+  variance: ["^variance"],
+  ticket: ["jira", "ticket"],
+  comment: ["^comments?", "^file name", "remark"]
 };
-const DEFAULT_INTERFACES           = [
-  "Enrollment IB", "Claims Clearing House", "Claims IB", "Provider IB – Tax entity", "Provider IB – Practitioner",
-  "Provider IB – Supplier", "Provider IB – Supplier Location", "Provider IB – Practitioner Role", "Authorization IB",
-  "Accumulator IB", "ID Cards-Extract", "ID Cards-Acknowledgement", "Correspondences- Extract", "Member Packets-Extract",
-  "Member Packets-Acknowledgement", "Claims Payment Extract", "External Pricing", "External Claims Editing",
-  "Encounter Submission", "Encounter Rejections"
+const DEFAULT_INTERFACES                 = [
+  {"name": "Enrollment IB"},
+  {"name": "Claims Clearing House"},
+  {"name": "Claims IB"},
+  {"name": "Provider IB – Tax entity", "sheet": "Provider IB", "block": "^Tax entity$"},
+  {"name": "Provider IB – Practitioner", "sheet": "Provider IB", "block": "^Practitioner$"},
+  {"name": "Provider IB – Supplier", "sheet": "Provider IB", "block": "^Supplier$"},
+  {"name": "Provider IB – Supplier Location", "sheet": "Provider IB", "block": "^Supplier Location$"},
+  {"name": "Provider IB – Practitioner Role", "sheet": "Provider IB", "block": "^Practitioner Role$"},
+  {"name": "Authorization IB"},
+  {"name": "Accumulator IB"},
+  {"name": "ID Cards-Extract"},
+  {"name": "ID Cards-Acknowledgement", "variance": "A-(B+C)"},
+  {"name": "Correspondences- Extract"},
+  {"name": "Member Packets-Extract"},
+  {"name": "Member Packets-Acknowledgement", "variance": "A-(B+C)"},
+  {"name": "Claims Payment Extract"},
+  {"name": "External Pricing"},
+  {"name": "External Claims Editing"},
+  {"name": "Encounter Submission", "block": "Extraction"},
+  {"name": "Encounter Rejections", "sheet": "Encounter Submission", "block": "Rejections", "columns": {"date": ["^to date$"], "received": ["^extracted"], "loaded": ["^loaded"], "error": ["^rejected"]}}
 ];
 
 function main(workbook                      , configJson         = "", asOf         = "", mode         = "build")              {
   const warnings           = [];
   const cfg              = configJson && configJson.trim() ? JSON.parse(configJson) : {};
-  const interfaces                 = cfg.interfaces && cfg.interfaces.length ? cfg.interfaces : DEFAULT_INTERFACES.map(n => {
-    const c               = { name: n }; return c;
-  });
+  const interfaces                 = cfg.interfaces && cfg.interfaces.length ? cfg.interfaces : DEFAULT_INTERFACES;
   const ifs = interfaces.map(x => x.name);
   const typ = interfaces.map(x => x.scheduleType ? x.scheduleType
     : /^Provider IB/.test(x.name) ? "Provider IB" : x.name === "Encounter Rejections" ? "Encounter Submission" : x.name);
@@ -123,102 +136,134 @@ function main(workbook                      , configJson         = "", asOf     
   const alias = new Map                ();
   const acc           = [];
   const accIdx = new Map                ();
+  const byLoose = new Map                (); // spelling variants of one name share an account
   const addAcc = (n        )         => {
     let k = accIdx.get(n);
-    if (k === undefined) { k = acc.length; acc.push(n); accIdx.set(n, k); }
+    if (k === undefined) { k = acc.length; acc.push(n); accIdx.set(n, k); if (!byLoose.has(loose(n))) byLoose.set(loose(n), k); }
     return k;
   };
   const aliases = cfg.accountAliases || {};
-  Object.keys(aliases).forEach(raw => { alias.set(norm(raw), aliases[raw]); addAcc(aliases[raw]); });
-  const ignore = new Set        ((cfg.ignoreAccounts || []).map(norm));
+  Object.keys(aliases).forEach(raw => { alias.set(loose(raw), aliases[raw]); addAcc(aliases[raw]); });
+  const ignore = new Set        ((cfg.ignoreAccounts || []).map(loose));
   const dropUnmapped = (cfg.unmappedAccounts || "keep").toLowerCase() === "drop";
   const unmapped = new Set        ();
   const resolve = (raw        )         => {
-    const n = norm(raw);
+    const n = loose(raw);
     if (!n || ignore.has(n)) return -1;
     const m = alias.get(n);
     if (m !== undefined) return addAcc(m);
+    const known = byLoose.get(n);
+    if (known !== undefined) return known;
     if (!unmapped.has(n)) { unmapped.add(n); warnings.push("Account '" + raw.trim() + "' is not in accountAliases — " + (dropUnmapped ? "dropped." : "kept under its tracker name.")); }
     return dropUnmapped ? -1 : addAcc(raw.trim());
   };
 
   // ---- read the tracker ----
-  const sheets = new Map                  ();
+  const sheets = new Map                    ();
   workbook.getWorksheets().forEach(ws => {
     const rng = ws.getUsedRange();
-    sheets.set(norm(ws.getName()), rng ? rng.getValues() : []);
+    const k = norm(ws.getName());
+    const list = sheets.get(k) || [];
+    list.push(rng ? rng.getValues() : []);
+    sheets.set(k, list);
   });
-  const explained = new RegExp(cfg.explainedCommentPattern || "\\b(n\\/?a|not applicable|no run|no file|holiday|on hold)\\b", "i");
+  const explained = new RegExp(cfg.explainedCommentPattern || "\\b(n\\/?a|not applicable|no run|no file|no load|no claims|holiday|on hold|(out of|not in) scope)\\b", "i");
   const facts = new Map              ();
   const X = new Set        ();
   const NI = ifs.length;
   let maxDay = -1, badDates = 0;
   const inspect = mode.toLowerCase() === "inspect";
 
+  const noFormula = (cfg.varianceWhenMissing || "formula").toLowerCase() === "none";
   interfaces.forEach((ic, i) => {
     const sheetName = ic.sheet || ic.name;
-    const values = sheets.get(norm(sheetName));
-    if (!values) { warnings.push("Interface '" + ic.name + "': sheet '" + sheetName + "' not found."); return; }
+    const tables = sheets.get(norm(sheetName));
+    if (!tables) { warnings.push("Interface '" + ic.name + "': sheet '" + sheetName + "' not found."); return; }
     const col = (role        )           => {
       const own = ic.columns ? pick(ic.columns, role) : undefined;
       const shared = cfg.columns ? pick(cfg.columns, role) : undefined;
       return own || shared || pick(DEFAULT_COLUMNS, role) || [];
     };
-    let hr = -1, cDate           = [], cAcc           = [];
-    for (let r = 0; r < Math.min(values.length, 25) && hr < 0; r++) {
-      cDate = findCols(values[r], col("date")); cAcc = findCols(values[r], col("account"));
-      if (cDate.length && cAcc.length) hr = r;
-    }
-    if (hr < 0) { warnings.push("Interface '" + ic.name + "': no header row with a date and an account column in sheet '" + sheetName + "'."); return; }
-    const H = values[hr];
-    const cRec = findCols(H, col("received")), cLd = findCols(H, col("loaded")), cErr = findCols(H, col("error")),
-      cPend = findCols(H, col("pending")), cVar = findCols(H, col("variance")), cTkt = findCols(H, col("ticket")),
-      cCom = findCols(H, col("comment"));
-    const cFil = ic.filterColumn ? findCols(H, [ic.filterColumn]) : [];
-    const names = (c          )         => c.length ? c.map(k => String(H[k]).trim()).join(" + ") : "—";
-    if (inspect) warnings.push("[inspect] " + ic.name + " <- sheet '" + sheetName + "' header row " + (hr + 1) + " | date: " + names(cDate.slice(0, 1)) +
-      " | account: " + names(cAcc.slice(0, 1)) + " | received: " + names(cRec) + " | loaded: " + names(cLd) + " | error: " + names(cErr) +
-      " | pending: " + names(cPend) + " | variance: " + names(cVar.slice(0, 1)) + " | ticket: " + names(cTkt.slice(0, 1)) + " | comment: " + names(cCom.slice(0, 1)));
-    if (!cRec.length) warnings.push("Interface '" + ic.name + "': no 'received' column matched.");
-    const computeVar = !cVar.length && (cfg.varianceWhenMissing || "none").toLowerCase() !== "none";
-    if (!cVar.length) warnings.push("Interface '" + ic.name + "': no variance column matched — " + (computeVar ? "using received − loaded − error − pending." : "every reported row will count as reconciled."));
-
-    for (let r = hr + 1; r < values.length; r++) {
-      const row = values[r];
-      const dv = row[cDate[0]];
-      if (dv === "" || dv === null || dv === undefined) continue;
-      const day = typeof dv === "number" ? Math.floor(dv) - 25569 : parseDay(String(dv), order);
-      if (day === null) { badDates++; continue; }
-      const d = day - T0;
-      if (d < 0 || d > cap || d >= KEY) continue;
-      if (cFil.length && norm(String(row[cFil[0]])) !== norm(ic.filterEquals || "")) continue;
-      const a = resolve(String(row[cAcc[0]]));
-      if (a < 0) continue;
-      let hasNum = false, isExplained = cCom.length > 0 && explained.test(String(row[cCom[0]]));
-      const total = (cols          )         => {
-        let s = 0;
-        cols.forEach(k => {
-          const n = num(row[k]);
-          if (n !== null) { s += n; hasNum = true; } else if (explained.test(String(row[k]))) isExplained = true;
-        });
-        return s;
-      };
-      const rec = total(cRec), ld = total(cLd), er = total(cErr), pe = total(cPend);
-      let v                = cVar.length ? num(row[cVar[0]]) : null;
-      if (v !== null) hasNum = true;
-      if (v === null && computeVar && hasNum) v = rec - ld - er - pe;
-      const k = (a * NI + i) * KEY + d;
-      if (isExplained && !hasNum) { X.add(k); if (d > maxDay) maxDay = d; continue; }
-      const tk = cTkt.length && isTicket(row[cTkt[0]]) ? 1 : 0;
-      const z = facts.get(k);
-      if (!z) facts.set(k, [d, a, i, rec, ld, er, pe, v === null ? null : Math.abs(v), tk]);
-      else {
-        z[3] += rec; z[4] += ld; z[5] += er; z[6] += pe;
-        z[7] = z[7] === null && v === null ? null : (z[7] || 0) + Math.abs(v || 0);
-        z[8] = z[8] || tk;
+    const blockRe = ic.block ? new RegExp(ic.block, "i") : null;
+    let used = 0;
+    tables.forEach(values => segments(values, col("account"), col("date")).forEach(seg => {
+      if (blockRe && !seg.titles.some(t => blockRe.test(t))) return;
+      const H = values[seg.hr];
+      const cDate = findCols(H, col("date"));
+      if (!cDate.length) return;
+      used++;
+      const cVar = findCols(H, col("variance")), cTkt = findCols(H, col("ticket")), cCom = findCols(H, col("comment"));
+      // count roles never take a ticket, comment, variance or date column ("Jira Ticket Number (to resolve Errors)")
+      const countCols = (role        )           => findCols(H, col(role)).filter(c => cTkt.indexOf(c) < 0 && cCom.indexOf(c) < 0 && cVar.indexOf(c) < 0 && c !== cDate[0]);
+      const cRec = countCols("received"), cLd = countCols("loaded"), cErr = countCols("error"), cPend = countCols("pending");
+      const cFil = ic.filterColumn ? findCols(H, [ic.filterColumn]) : [];
+      // lettered count columns, e.g. "Received (A)" -> A; used for the variance formula and to tell filled rows from empty ones
+      const letters = new Map                ();
+      const derived = new Map                (); // column -> its own header formula, e.g. "Loaded into HRP (E) E = F+G+H"
+      const counts           = cRec.concat(cLd, cErr, cPend);
+      for (let c = 0; c < H.length; c++) {
+        if (cVar.indexOf(c) >= 0) continue;
+        const text = String(H[c]).replace(/\s+/g, " ").trim();
+        const m = /\(\s*([A-Z])\s*\)/.exec(text);
+        if (!m) continue;
+        if (!letters.has(m[1])) letters.set(m[1], c);
+        if (counts.indexOf(c) < 0) counts.push(c);
+        const def = new RegExp("\\b" + m[1] + "\\s*=\\s*([A-Z+\\s]+)$").exec(text);
+        if (def) derived.set(c, def[1]);
       }
-      if (d > maxDay) maxDay = d;
-    }
+      const tail = cVar.length ? /(?:\b[A-Z]\b|[()+\-\s])+$/.exec(String(H[cVar[0]]).replace(/\s+/g, " ").trim()) : null;
+      const formula = noFormula ? "" : ic.variance || (tail ? tail[0].trim() : "");
+      const names = (c          )         => c.length ? c.map(k => String(H[k]).replace(/\s+/g, " ").trim()).join(" + ") : "—";
+      if (inspect) warnings.push("[inspect] " + ic.name + " <- sheet '" + sheetName + "' header row " + (seg.hr + 1) + (seg.titles.length ? " [" + seg.titles.join(" / ") + "]" : "") +
+        " | date: " + names(cDate.slice(0, 1)) + " | account: " + String(H[seg.accCol] || "column " + (seg.accCol + 1)).trim() + " | received: " + names(cRec) + " | loaded: " + names(cLd) +
+        " | error: " + names(cErr) + " | pending: " + names(cPend) + " | variance: " + names(cVar.slice(0, 1)) + (formula ? " (if blank: " + formula + ")" : "") + " | ticket: " + names(cTkt) + " | comment: " + names(cCom));
+      if (!cRec.length) warnings.push("Interface '" + ic.name + "': no 'received' column matched.");
+      if (!cVar.length && !formula) warnings.push("Interface '" + ic.name + "': no variance column — every reported row counts as reconciled.");
+
+      for (let r = seg.hr + 1; r < seg.end; r++) {
+        const row = values[r];
+        const dv = row[cDate[0]];
+        // rows without a date are template rows: ignored
+        if (dv === "" || dv === null || dv === undefined) continue;
+        let day               ;
+        if (typeof dv === "number") day = Math.floor(dv) - 25569;
+        else { const txt = String(dv).trim(); if (!txt || /^(n\/?a|-|tbd)$/i.test(txt)) continue; day = parseDay(txt, order); }
+        if (day === null) { badDates++; continue; }
+        const d = day - T0;
+        if (d < 0 || d > cap || d >= KEY) continue;
+        if (cFil.length && norm(String(row[cFil[0]])) !== norm(ic.filterEquals || "")) continue;
+        const a = resolve(String(row[seg.accCol]));
+        if (a < 0) continue;
+        let isExplained = cCom.some(k => explained.test(String(row[k])));
+        // a row is "reported" only when at least one count has been entered
+        let hasNum = false;
+        counts.forEach(k => { if (num(row[k]) !== null) hasNum = true; else if (explained.test(String(row[k]))) isExplained = true; });
+        // value of a count cell; a blank cell with a header formula is derived from its parts
+        const cellVal = (c        , depth        )         => {
+          const n = num(row[c]);
+          if (n !== null) return n;
+          const f = derived.get(c);
+          return f && depth < 4 ? evalFormula(f, L => letterVal(L, depth + 1)) || 0 : 0;
+        };
+        const letterVal = (L        , depth        )                => { const c = letters.get(L); return c === undefined ? null : cellVal(c, depth); };
+        const total = (cols          )         => { let t = 0; cols.forEach(k => { t += cellVal(k, 0); }); return t; };
+        const k = (a * NI + i) * KEY + d;
+        if (!hasNum) { if (isExplained) { X.add(k); if (d > maxDay) maxDay = d; } continue; }
+        const rec = total(cRec), ld = total(cLd), er = total(cErr), pe = total(cPend);
+        let v                = cVar.length ? num(row[cVar[0]]) : null;
+        if (v === null && formula) v = evalFormula(formula, L => letterVal(L, 0));
+        const tk = cTkt.some(c => isTicket(row[c])) ? 1 : 0;
+        const z = facts.get(k);
+        if (!z) facts.set(k, [d, a, i, rec, ld, er, pe, v === null ? null : Math.abs(v), tk]);
+        else {
+          z[3] += rec; z[4] += ld; z[5] += er; z[6] += pe;
+          z[7] = z[7] === null && v === null ? null : (z[7] || 0) + Math.abs(v || 0);
+          z[8] = z[8] || tk;
+        }
+        if (d > maxDay) maxDay = d;
+      }
+    }));
+    if (!used) warnings.push("Interface '" + ic.name + "': no table with a date column found in sheet '" + sheetName + "'" + (ic.block ? " under a title matching '" + ic.block + "'." : "."));
   });
   if (badDates) warnings.push(badDates + " row(s) skipped because the date could not be read (check dateOrder).");
 
@@ -227,7 +272,7 @@ function main(workbook                      , configJson         = "", asOf     
   const schName = cfg.scheduleSheet || "Recon Report Schedule";
   const sv = sheets.get(norm(schName));
   if (!sv) warnings.push("Schedule sheet '" + schName + "' not found — nothing can be flagged as scheduled but not reported.");
-  else readSchedule(sv, typ, resolve, acc, sch, warnings, inspect);
+  else readSchedule(sv[sv.length - 1], typ, resolve, acc, sch, warnings, inspect, (cfg.scheduleIgnoreTypes || ["TM Aging Summary"]).map(norm));
 
   if (maxDay < 0) warnings.push("No tracker rows were read. Run with mode = inspect and adjust recon-config.json.");
   const LAST = Math.max(0, asOfDay === null ? maxDay : Math.min(maxDay, cap));
@@ -236,7 +281,10 @@ function main(workbook                      , configJson         = "", asOf     
   const model        = { acc, ifs, typ, sch, F: facts, X, NA, NI, T0, LAST, DEF: LAST, anomMin: cfg.anomalyMinMedian || 200, anomFactor: cfg.anomalyFactor || 3 };
   const perDayRows           = [];
   facts.forEach(r => { perDayRows[r[0]] = (perDayRows[r[0]] || 0) + 1; });
-  const minRows = cfg.minRowsForDefaultDay === undefined ? 100 : cfg.minRowsForDefaultDay;
+  // default day = latest day that looks complete: at least 60% of the busiest day's rows (or the configured minimum)
+  let busiest = 0;
+  perDayRows.forEach(n => { if (n > busiest) busiest = n; });
+  const minRows = cfg.minRowsForDefaultDay === undefined ? Math.max(1, Math.ceil(busiest * 0.6)) : cfg.minRowsForDefaultDay;
   while (model.DEF > 0 && (perDayRows[model.DEF] || 0) < minRows) model.DEF--;
 
   // ---- dataset for the dashboard page ----
@@ -280,6 +328,43 @@ function main(workbook                      , configJson         = "", asOf     
 }
 
 /* ======================= reading helpers ======================= */
+
+/** Account key: case, spacing and punctuation do not matter ("MedStar" = "Medstar", "Zing Health" = "ZingHealth"). */
+function loose(s        )         { return norm(s).replace(/[^a-z0-9]/g, ""); }
+
+/** Tables inside a sheet: one per header row (a row with a Variance column, or with account + date columns). */
+function segments(values          , accPat          , datePat          )            {
+  const out            = [];
+  for (let r = 0; r < values.length; r++) {
+    const acc = findCols(values[r], accPat);
+    if (!findCols(values[r], ["^variance"]).length && !(acc.length && findCols(values[r], datePat.concat(["date"])).length)) continue;
+    const titles           = [];
+    for (let k = Math.max(0, r - 3); k < r; k++) values[k].forEach(c => { const t = String(c === null || c === undefined ? "" : c).replace(/\s+/g, " ").trim(); if (t && typeof c === "string") titles.push(t); });
+    if (out.length) out[out.length - 1].end = r;
+    out.push({ hr: r, end: values.length, titles, accCol: acc.length ? acc[0] : out.length ? out[out.length - 1].accCol : 0 });
+  }
+  return out;
+}
+
+/** Evaluates a header formula such as "A-(B+C+D)" or "(A + B) - (C+D+E)". null when it cannot be evaluated. */
+function evalFormula(expr        , val                                   )                {
+  const t = expr.replace(/\s+/g, "");
+  let p = 0, ok = t.length > 0;
+  const term = ()         => {
+    const ch = t.charAt(p);
+    if (ch === "(") { p++; const v = sum(); if (t.charAt(p) === ")") p++; else ok = false; return v; }
+    if (ch === "-") { p++; return -term(); }
+    if (/[A-Z]/.test(ch)) { p++; const v = val(ch); if (v === null) ok = false; return v || 0; }
+    ok = false; p++; return 0;
+  };
+  const sum = ()         => {
+    let v = term();
+    while (ok && (t.charAt(p) === "+" || t.charAt(p) === "-")) { const op = t.charAt(p); p++; const w = term(); v = op === "+" ? v + w : v - w; }
+    return v;
+  };
+  const v = sum();
+  return ok && p === t.length ? v : null;
+}
 
 function norm(s        )         { return String(s === null || s === undefined ? "" : s).replace(/\s+/g, " ").trim().toLowerCase(); }
 
@@ -375,7 +460,7 @@ function dayFlags(v      )                {
  *   C) Account | <one column per interface type>         (cell = "Mon-Fri", "Daily", "N/A", ...)
  */
 function readSchedule(v          , typ          , resolve                         , acc          ,
-  sch                                            , warnings          , inspect         )       {
+  sch                                            , warnings          , inspect         , ignoreTypes          )       {
   const types           = [];
   typ.forEach(t => { if (types.indexOf(t) < 0) types.push(t); });
   const typeOf = (label        )                => {
@@ -400,8 +485,11 @@ function readSchedule(v          , typ          , resolve                       
     for (let k = 0; k < 7; k++) m += flags.charAt(k) === "1" || o.charAt(k) === "1" ? "1" : "0";
     s[t] = m;
   };
+  let lastAcc = "";
   for (let r = hr + 1; r < v.length; r++) {
-    const raw = String(v[r][cAcc[0]]);
+    let raw = String(v[r][cAcc[0]]);
+    // merged account cells: only the first row of each account carries the name
+    if (raw.trim()) lastAcc = raw; else if (layout !== "C") raw = lastAcc;
     if (!raw.trim()) continue;
     const a = resolve(raw);
     if (a < 0) continue;
@@ -409,14 +497,14 @@ function readSchedule(v          , typ          , resolve                       
       for (let c = 0; c < H.length; c++) {
         if (c === cAcc[0] || !String(H[c]).trim()) continue;
         const t = typeOf(String(H[c]));
-        if (!t) { unknown.add(String(H[c]).trim()); continue; }
+        if (!t) { if (ignoreTypes.indexOf(norm(String(H[c]))) < 0) unknown.add(String(H[c]).trim()); continue; }
         const fl = dayFlags(v[r][c]);
         if (fl === null) warnings.push("Schedule: '" + String(v[r][c]) + "' (" + raw.trim() + " / " + t + ") not understood — treated as not scheduled.");
         put(a, t, fl || "0000000");
       }
     } else {
       const t = typeOf(String(v[r][cIf[0]]));
-      if (!t) { if (String(v[r][cIf[0]]).trim()) unknown.add(String(v[r][cIf[0]]).trim()); continue; }
+      if (!t) { const u = String(v[r][cIf[0]]).trim(); if (u && ignoreTypes.indexOf(norm(u)) < 0) unknown.add(u); continue; }
       let fl                = "";
       if (layout === "A") cDays.forEach(c => { fl += c >= 0 && dayFlags(v[r][c]) === "1111111" ? "1" : "0"; });
       else fl = dayFlags(v[r][cExpr[0]]);
@@ -719,7 +807,7 @@ async function readXlsx(buffer) {
       const t = attr(a, 't'), vm = /<v\b[^>]*>([\s\S]*?)<\/v>/.exec(inner);
       let v = '';
       if (t === 'inlineStr') v = runs(inner);
-      else if (!vm) return m;
+      else if (!vm || vm[1] === '') return m; /* formula without a stored result = blank */
       else if (t === 's') v = shared[+vm[1]] === undefined ? '' : shared[+vm[1]];
       else if (t === 'b') v = vm[1] === '1';
       else if (t === 'str' || t === 'e') v = unesc(vm[1]);
@@ -913,16 +1001,29 @@ S.p='w';render();
     let D, warnings = [];
     if (cfg.dataUrl) D = await (await get(cfg.dataUrl, 'The published dataset')).json();
     else {
-      const url = cfg.trackerUrl || (cfg.siteUrl || '').replace(/\/$/, '') + "/_api/web/GetFileByServerRelativePath(decodedurl='" + encodeURIComponent(String(cfg.trackerPath || '').replace(/'/g, "''")) + "')/$value";
-      if (!cfg.trackerUrl && !(cfg.siteUrl && cfg.trackerPath)) throw new Error('recon-config.json needs siteUrl and trackerPath (or trackerUrl / dataUrl).');
-      const sheets = await readXlsx(await (await get(url, 'The recon tracker workbook')).arrayBuffer());
-      const workbook = { getWorksheets: () => Object.keys(sheets).map((n) => ({ getName: () => n, getUsedRange: () => (sheets[n].length ? { getValues: () => sheets[n] } : undefined) })) };
+      const site = (cfg.siteUrl || '').replace(/\/$/, '');
+      const api = (kind, p) => site + "/_api/web/Get" + kind + "ByServerRelativePath(decodedurl='" + encodeURIComponent(String(p).replace(/'/g, "''")) + "')";
+      if (!cfg.trackerUrl && !(site && cfg.trackerPath)) throw new Error('recon-config.json needs siteUrl and trackerPath (or trackerUrl / dataUrl).');
+      /* current workbook last, so its rows and schedule win; archived weekly workbooks (optional) before it */
+      const books = [];
+      if (cfg.archiveFolder) {
+        const list = await (await fetch(api('Folder', cfg.archiveFolder) + '/Files?$select=Name,ServerRelativeUrl&$top=5000', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json;odata=nometadata' } })).json();
+        const current = String(cfg.trackerPath || '').toLowerCase(), only = cfg.archivePattern ? new RegExp(cfg.archivePattern, 'i') : null;
+        (list.value || []).filter((f) => /\.xls[xm]$/i.test(f.Name) && f.Name.charAt(0) !== '~' && f.ServerRelativeUrl.toLowerCase() !== current && (!only || only.test(f.Name)))
+          .forEach((f) => books.push({ name: f.Name, url: api('File', f.ServerRelativeUrl) + '/$value' }));
+      }
+      books.push({ name: 'recon tracker', url: cfg.trackerUrl || api('File', cfg.trackerPath) + '/$value' });
+      const read = await Promise.all(books.map(async (b) => readXlsx(await (await get(b.url, 'Workbook "' + b.name + '"')).arrayBuffer())));
+      const worksheets = [];
+      read.forEach((sheets) => Object.keys(sheets).forEach((n) => worksheets.push({ getName: () => n, getUsedRange: () => (sheets[n].length ? { getValues: () => sheets[n] } : undefined) })));
+      const workbook = { getWorksheets: () => worksheets };
+      const sheets = read[read.length - 1];
       /* ?asOf=yyyy-MM-dd shows the page as of an earlier day */
       const today = qs.get('asOf') || new Intl.DateTimeFormat('en-CA', cfg.timeZone ? { timeZone: cfg.timeZone } : {}).format(new Date());
       const inspect = qs.get('mode') === 'inspect';
       const res = main(workbook, JSON.stringify(cfg), today, inspect ? 'inspect' : 'build');
       warnings = res.warnings;
-      if (inspect || !res.ok) { show(inspect ? 'Tracker inspection' : 'No tracker rows could be read', ['Sheets: ' + Object.keys(sheets).join(' · ')].concat(warnings)); return; }
+      if (inspect || !res.ok) { show(inspect ? 'Tracker inspection' : 'No tracker rows could be read', ['Workbooks read: ' + books.map((b) => b.name).join(' · '), 'Sheets: ' + Object.keys(sheets).join(' · ')].concat(warnings)); return; }
       D = JSON.parse(res.dataJson);
     }
     startDashboard(D);

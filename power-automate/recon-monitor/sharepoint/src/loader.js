@@ -16,16 +16,29 @@
     let D, warnings = [];
     if (cfg.dataUrl) D = await (await get(cfg.dataUrl, 'The published dataset')).json();
     else {
-      const url = cfg.trackerUrl || (cfg.siteUrl || '').replace(/\/$/, '') + "/_api/web/GetFileByServerRelativePath(decodedurl='" + encodeURIComponent(String(cfg.trackerPath || '').replace(/'/g, "''")) + "')/$value";
-      if (!cfg.trackerUrl && !(cfg.siteUrl && cfg.trackerPath)) throw new Error('recon-config.json needs siteUrl and trackerPath (or trackerUrl / dataUrl).');
-      const sheets = await readXlsx(await (await get(url, 'The recon tracker workbook')).arrayBuffer());
-      const workbook = { getWorksheets: () => Object.keys(sheets).map((n) => ({ getName: () => n, getUsedRange: () => (sheets[n].length ? { getValues: () => sheets[n] } : undefined) })) };
+      const site = (cfg.siteUrl || '').replace(/\/$/, '');
+      const api = (kind, p) => site + "/_api/web/Get" + kind + "ByServerRelativePath(decodedurl='" + encodeURIComponent(String(p).replace(/'/g, "''")) + "')";
+      if (!cfg.trackerUrl && !(site && cfg.trackerPath)) throw new Error('recon-config.json needs siteUrl and trackerPath (or trackerUrl / dataUrl).');
+      /* current workbook last, so its rows and schedule win; archived weekly workbooks (optional) before it */
+      const books = [];
+      if (cfg.archiveFolder) {
+        const list = await (await fetch(api('Folder', cfg.archiveFolder) + '/Files?$select=Name,ServerRelativeUrl&$top=5000', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json;odata=nometadata' } })).json();
+        const current = String(cfg.trackerPath || '').toLowerCase(), only = cfg.archivePattern ? new RegExp(cfg.archivePattern, 'i') : null;
+        (list.value || []).filter((f) => /\.xls[xm]$/i.test(f.Name) && f.Name.charAt(0) !== '~' && f.ServerRelativeUrl.toLowerCase() !== current && (!only || only.test(f.Name)))
+          .forEach((f) => books.push({ name: f.Name, url: api('File', f.ServerRelativeUrl) + '/$value' }));
+      }
+      books.push({ name: 'recon tracker', url: cfg.trackerUrl || api('File', cfg.trackerPath) + '/$value' });
+      const read = await Promise.all(books.map(async (b) => readXlsx(await (await get(b.url, 'Workbook "' + b.name + '"')).arrayBuffer())));
+      const worksheets = [];
+      read.forEach((sheets) => Object.keys(sheets).forEach((n) => worksheets.push({ getName: () => n, getUsedRange: () => (sheets[n].length ? { getValues: () => sheets[n] } : undefined) })));
+      const workbook = { getWorksheets: () => worksheets };
+      const sheets = read[read.length - 1];
       /* ?asOf=yyyy-MM-dd shows the page as of an earlier day */
       const today = qs.get('asOf') || new Intl.DateTimeFormat('en-CA', cfg.timeZone ? { timeZone: cfg.timeZone } : {}).format(new Date());
       const inspect = qs.get('mode') === 'inspect';
       const res = main(workbook, JSON.stringify(cfg), today, inspect ? 'inspect' : 'build');
       warnings = res.warnings;
-      if (inspect || !res.ok) { show(inspect ? 'Tracker inspection' : 'No tracker rows could be read', ['Sheets: ' + Object.keys(sheets).join(' · ')].concat(warnings)); return; }
+      if (inspect || !res.ok) { show(inspect ? 'Tracker inspection' : 'No tracker rows could be read', ['Workbooks read: ' + books.map((b) => b.name).join(' · '), 'Sheets: ' + Object.keys(sheets).join(' · ')].concat(warnings)); return; }
       D = JSON.parse(res.dataJson);
     }
     startDashboard(D);
