@@ -140,7 +140,7 @@ test('stacked tables and several workbooks round-trip', () => {
     sch: { 'Plan A': { 'Enrollment IB': '1111111', 'Provider IB': '1111100', 'Encounter Submission': '0100000' }, 'Plan B': { 'Enrollment IB': '1111100', 'Provider IB': '0000000', 'Encounter Submission': '1000001' } } };
   for (let d = 0; d < 12; d++) for (let a = 0; a < 2; a++) for (let i = 0; i < ifs.length; i++) if ((d + a + i) % 3) D.f.push([d, a, i, 100 + d + i, 90 + d, 4, 6 + i, (d * i) % 4 ? 0 : i + 1, (d + i) % 2]);
   const wb = (from, to) => mockWorkbook(datasetToWorkbook({ ...D, f: D.f.filter((r) => r[0] >= from && r[0] <= to), x: D.x.filter((r) => r[0] >= from && r[0] <= to) }));
-  const two = { getWorksheets: () => wb(0, 6).getWorksheets().concat(wb(7, 11).getWorksheets()) };   // archived week + current week
+  const two = { getWorksheets: () => wb(0, 8).getWorksheets().concat(wb(7, 11).getWorksheets()) };   // archived weeks + current week, days 7-8 in both: counted once
   const r = os.main(two, JSON.stringify({ startDate: START, accountAliases: { 'Plan A': 'Plan A', 'Plan B': 'Plan B' } }), addDays(START, 11));
   assert.deepEqual(r.warnings.filter((x) => !/not found|accountAliases|no table with a date column/.test(x)), []); // the made-up tracker has 6 of the 20 interfaces
   const data = JSON.parse(r.dataJson), key = (x) => x.slice(0, 3).join('|');

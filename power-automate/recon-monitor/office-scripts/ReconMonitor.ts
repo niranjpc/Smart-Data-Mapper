@@ -159,6 +159,7 @@ function main(workbook: ExcelScript.Workbook, configJson: string = "", asOf: str
   });
   const explained = new RegExp(cfg.explainedCommentPattern || "\\b(n\\/?a|not applicable|no run|no file|no load|no claims|holiday|on hold|(out of|not in) scope)\\b", "i");
   const facts = new Map<number, Fact>();
+  const owner = new Map<number, number>(); // feed key -> workbook that supplied it
   const X = new Set<number>();
   const NI = ifs.length;
   let maxDay = -1, badDates = 0;
@@ -176,7 +177,7 @@ function main(workbook: ExcelScript.Workbook, configJson: string = "", asOf: str
     };
     const blockRe = ic.block ? new RegExp(ic.block, "i") : null;
     let used = 0;
-    tables.forEach(values => segments(values, col("account"), col("date")).forEach(seg => {
+    tables.forEach((values, book) => segments(values, col("account"), col("date")).forEach(seg => {
       if (blockRe && !seg.titles.some(t => blockRe.test(t))) return;
       const H = values[seg.hr];
       const cDate = findCols(H, col("date"));
@@ -243,7 +244,9 @@ function main(workbook: ExcelScript.Workbook, configJson: string = "", asOf: str
         let v: number | null = cVar.length ? num(row[cVar[0]]) : null;
         if (v === null && formula) v = evalFormula(formula, L => letterVal(L, 0));
         const tk = cTkt.some(c => isTicket(row[c])) ? 1 : 0;
-        const z = facts.get(k);
+        // rows of one workbook add up; a later workbook (the current week) replaces what an archived one said for the same feed
+        const z = owner.get(k) === book ? facts.get(k) : undefined;
+        owner.set(k, book);
         if (!z) facts.set(k, [d, a, i, rec, ld, er, pe, v === null ? null : Math.abs(v), tk]);
         else {
           z[3] += rec; z[4] += ld; z[5] += er; z[6] += pe;
