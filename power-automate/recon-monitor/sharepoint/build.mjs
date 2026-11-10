@@ -1,4 +1,4 @@
-// Builds sharepoint/Reconciliation-Monitor.aspx — one self-contained live page — from the shared sources:
+// Builds sharepoint/Reconciliation-Monitor.aspx (+ an identical .html) — one self-contained live page — from the shared sources:
 //   node sharepoint/build.mjs
 import { readFileSync, writeFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
@@ -20,5 +20,6 @@ const out = tpl.slice(0, open) +
   '\n/* ===== workbook reader ===== */\n' + read('sharepoint/src/xlsx-reader.js') +
   '\n/* ===== dashboard ===== */\nfunction startDashboard(D){' + page + '}\n' +
   '\n/* ===== live loader ===== */\n' + read('sharepoint/src/loader.js') + tpl.slice(close);
-writeFileSync(path.join(here, 'Reconciliation-Monitor.aspx'), out);
-console.log('sharepoint/Reconciliation-Monitor.aspx', Math.round(out.length / 1024) + ' KB');
+// .aspx for SharePoint; identical .html for opening from disk (browsers do not render .aspx files locally)
+for (const f of ['Reconciliation-Monitor.aspx', 'Reconciliation-Monitor.html']) writeFileSync(path.join(here, f), out);
+console.log('sharepoint/Reconciliation-Monitor.aspx + .html', Math.round(out.length / 1024) + ' KB');

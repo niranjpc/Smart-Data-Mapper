@@ -54,7 +54,18 @@ Each **feed** is one customer × interface × day.
 | Highlights | Day: biggest variance, variances needing a ticket, feeds not reported, volume check, vs previous day. Week: top contributor, feeds failing 2+ days, worst day, vs previous week. Month: vs previous month, heaviest week, most days not reconciled, ticket coverage |
 | History | Weekly reconciled rate per customer with last-4 vs prior-4 weeks, recurring issues (weeks affected, longest run, % ticketed), weekly quality (rate, ticket coverage, schedule adherence) |
 
-## Live page in SharePoint
+## How to check it
+
+**1. On your PC (no SharePoint set-up needed).** Open `sharepoint/Reconciliation-Monitor.html` in Edge or
+Chrome, pick the current workbook, the archived weekly workbooks and `recon-config.json` together. The files
+are read in the browser, nothing is uploaded. This is the same page and code as the SharePoint version.
+Add `?mode=inspect` to the address to see which sheets and columns were matched, `?asOf=2026-11-09` to
+view an earlier day.
+
+**2. In SharePoint.** Follow the steps below, then open `…/Reconciliation-Monitor.aspx?mode=inspect` first
+and the page without parameters after. If the page downloads instead of opening, or the upload of the
+`.aspx` is refused, custom script is disabled on the site (see the note under the steps).
+
 
 The page holds everything: the rules, a built-in `.xlsx` reader and the dashboard. On opening it fetches
 `recon-config.json` from its own folder, downloads the tracker through the SharePoint REST API with the
@@ -70,8 +81,11 @@ viewer's sign-in, computes the dashboard in the browser and renders it. No data 
 4. Open the page without parameters, then link or embed it the same way as the Batch Monitor page.
 
 - Viewers need read access to the tracker workbook; the page shows what the last **saved** version contains.
-- The site must allow `.aspx` pages with script in the library (custom script setting), as for any
-  hand-built page.
+- **Custom script.** A page with its own script only runs on a site where custom script is allowed
+  (*Allow users to run custom script*; PowerShell `Set-SPOSite <site> -DenyAddAndCustomizePages 0`). It is
+  off by default on modern sites and only a SharePoint admin can change it; Microsoft has also made the
+  setting revert automatically after a period unless the tenant delays that. Ask your admin which applies.
+  If it cannot be allowed, the same code can be packaged as an SPFx web part, which runs without it.
 - `?asOf=2026-11-06` shows the dashboard as of an earlier day; `?config=<url>` uses another configuration file.
 - Tracker warnings (unmatched sheets, columns, account names) appear in a collapsible note at the bottom.
 - Setting `dataUrl` in the configuration makes the page load a published dataset (the flow's `dataJson`)
