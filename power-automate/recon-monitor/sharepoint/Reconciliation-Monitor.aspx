@@ -72,10 +72,18 @@ svg.ch{width:100%;height:auto}.gl{stroke:#e6ebf1}.ax{fill:var(--mut);font-size:1
  * Parameters (all optional):
  *   configJson : contents of recon-config.json ("" = built-in defaults)
  *   asOf       : yyyy-MM-dd upper bound for the data (normally "today" in the business time zone)
- *   mode       : "build" (default) or "inspect" (lists sheets + detected columns in warnings)
+ *   mode       : "build" (default), "inspect" (lists sheets + detected columns in warnings) or
+ *                "extract" (reads this workbook only and returns its rows in extractJson — run on each archived week)
+ *   archiveJson: JSON array of the extractJson outputs of the archived weeks, oldest first ("" = none).
+ *                Rows of this workbook replace archived rows for the same customer, interface and day.
  */
 
 /** [day, account, interface, received, loaded, error, pending, variance|null, ticket 0/1] */
+
+/**
+ * Rows of one workbook, compact: f = [day, customer, interface, received, loaded, error, pending, |variance| | null, ticket 0/1],
+ * x = [day, customer, interface] (explained, not reported); day counts from start, customer / interface index acc / ifs.
+ */
 
 const MS_DAY = 86400000;
 const KEY = 100000; // day slots per (account, interface) key
@@ -116,7 +124,7 @@ const DEFAULT_INTERFACES                 = [
   {"name": "Encounter Rejections", "sheet": "Encounter Submission", "block": "Rejections", "columns": {"date": ["^to date$"], "received": ["^extracted"], "loaded": ["^loaded"], "error": ["^rejected"]}}
 ];
 
-function main(workbook                      , configJson         = "", asOf         = "", mode         = "build")              {
+function main(workbook                      , configJson         = "", asOf         = "", mode         = "build", archiveJson         = "")              {
   const warnings           = [];
   const cfg              = configJson && configJson.trim() ? JSON.parse(configJson) : {};
   const interfaces                 = cfg.interfaces && cfg.interfaces.length ? cfg.interfaces : DEFAULT_INTERFACES;
@@ -161,7 +169,7 @@ function main(workbook                      , configJson         = "", asOf     
   // ---- read the tracker ----
   const sheets = new Map                    ();
   workbook.getWorksheets().forEach(ws => {
-    const rng = ws.getUsedRange();
+    const rng = ws.getUsedRange(true); // values only — ignores cells that are merely formatted
     const k = norm(ws.getName());
     const list = sheets.get(k) || [];
     list.push(rng ? rng.getValues() : []);
@@ -174,6 +182,33 @@ function main(workbook                      , configJson         = "", asOf     
   const NI = ifs.length;
   let maxDay = -1, badDates = 0;
   const inspect = mode.toLowerCase() === "inspect";
+
+  // ---- archived weeks (outputs of mode "extract"), oldest first; the workbook being read wins over them ----
+  const archives             = archiveJson && archiveJson.trim() ? JSON.parse(archiveJson) : [];
+  archives.forEach((ex, n) => {
+    const book = n - archives.length; // negative: below every table of this workbook
+    const base = parseDay(ex.start || "", "YMD");
+    if (base === null) { warnings.push("Archived week " + (n + 1) + " has no start date — ignored."); return; }
+    const ai = (ex.acc || []).map(name => resolve(name)), ii = (ex.ifs || []).map(name => ifs.indexOf(name));
+    const val = (v               )         => Number(v) || 0;
+    (ex.f || []).forEach(r => {
+      const d = base + val(r[0]) - T0, a = ai[val(r[1])], i = ii[val(r[2])];
+      if (a === undefined || a < 0 || i === undefined || i < 0 || d < 0 || d > cap || d >= KEY) return;
+      const k = (a * NI + i) * KEY + d;
+      const v = r[7] === null || r[7] === undefined ? null : val(r[7]);
+      const z = owner.get(k) === book ? facts.get(k) : undefined;
+      owner.set(k, book);
+      if (!z) facts.set(k, [d, a, i, val(r[3]), val(r[4]), val(r[5]), val(r[6]), v, val(r[8]) ? 1 : 0]);
+      else { z[3] += val(r[3]); z[4] += val(r[4]); z[5] += val(r[5]); z[6] += val(r[6]); z[7] = z[7] === null && v === null ? null : (z[7] || 0) + (v || 0); z[8] = z[8] || (val(r[8]) ? 1 : 0); }
+      if (d > maxDay) maxDay = d;
+    });
+    (ex.x || []).forEach(r => {
+      const d = base + r[0] - T0, a = ai[r[1]], i = ii[r[2]];
+      if (a === undefined || a < 0 || i === undefined || i < 0 || d < 0 || d > cap || d >= KEY) return;
+      X.add((a * NI + i) * KEY + d);
+      if (d > maxDay) maxDay = d;
+    });
+  });
 
   const noFormula = (cfg.varianceWhenMissing || "formula").toLowerCase() === "none";
   interfaces.forEach((ic, i) => {
@@ -278,6 +313,18 @@ function main(workbook                      , configJson         = "", asOf     
   else readSchedule(sv[sv.length - 1], typ, resolve, acc, sch, warnings, inspect, (cfg.scheduleIgnoreTypes || ["TM Aging Summary"]).map(norm));
 
   if (maxDay < 0) warnings.push("No tracker rows were read. Run with mode = inspect and adjust recon-config.json.");
+
+  if (mode.toLowerCase() === "extract") {
+    const ex           = { start: new Date(T0 * MS_DAY).toISOString().slice(0, 10), acc, ifs, f: [], x: [] };
+    facts.forEach(r => ex.f.push(r.slice()));
+    X.forEach(k => ex.x.push([k % KEY, Math.floor(Math.floor(k / KEY) / NI), Math.floor(k / KEY) % NI]));
+    const none        = { inScope: 0, fullyReconciled: 0, notFullyReconciled: 0, trackedViaTicket: 0, notTrackedViaTicket: 0, notReported: 0, varianceSum: 0, reconciledRate: -1 };
+    return {
+      ok: maxDay >= 0, asOf: "", defaultDay: "", generated: new Date().toISOString(), dataJson: "", digestJson: "",
+      daily: none, weekly: none, monthly: none, dailyLabel: "", weeklyLabel: "", monthlyLabel: "",
+      needsAttention: false, subject: "", emailHtml: "", warnings, extractJson: JSON.stringify(ex)
+    };
+  }
   const LAST = Math.max(0, asOfDay === null ? maxDay : Math.min(maxDay, cap));
   const NA = acc.length;
 
@@ -326,7 +373,7 @@ function main(workbook                      , configJson         = "", asOf     
     dataJson, digestJson: JSON.stringify(digest),
     daily: tiles(oD), weekly: tiles(oW), monthly: tiles(oM),
     dailyLabel, weeklyLabel, monthlyLabel, needsAttention, subject,
-    emailHtml: emailHtml(model, dailyLabel, oD, hD, weeklyLabel, oW, cfg.dashboardUrl || ""), warnings
+    emailHtml: emailHtml(model, dailyLabel, oD, hD, weeklyLabel, oW, cfg.dashboardUrl || ""), warnings, extractJson: ""
   };
 }
 

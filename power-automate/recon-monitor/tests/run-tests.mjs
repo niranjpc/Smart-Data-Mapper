@@ -148,6 +148,13 @@ test('stacked tables and several workbooks round-trip', () => {
   assert.deepEqual(Object.fromEntries(data.f.map((x) => [key(x), x])), Object.fromEntries(D.f.map(remap).map((x) => [key(x), x])));
   assert.deepEqual(data.x.map(key).sort(), D.x.map(remap).map(key).sort());
   assert.deepEqual(data.sch, D.sch);
+  // the flow's route: "extract" on each archived workbook, then build on the current one with archiveJson
+  const cfg = JSON.stringify({ startDate: START, accountAliases: { 'Plan A': 'Plan A', 'Plan B': 'Plan B' } });
+  const ex = os.main(wb(0, 8), cfg, addDays(START, 11), 'extract');
+  assert.equal(ex.dataJson, ''); assert.ok(JSON.parse(ex.extractJson).f.length > 0);
+  const viaFlow = os.main(wb(7, 11), cfg, addDays(START, 11), 'build', '[' + ex.extractJson + ']');
+  const strip = (j) => { const o = JSON.parse(j); delete o.gen; o.f = o.f.map(String).sort(); o.x = o.x.map(String).sort(); return o; }; // row order may differ
+  assert.deepEqual(strip(viaFlow.dataJson), strip(r.dataJson));
 });
 
 // ---- SharePoint live page: built-in .xlsx reader + generated page ----

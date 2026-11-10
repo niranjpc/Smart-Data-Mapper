@@ -1,29 +1,36 @@
 # Reconciliation Monitor on Power Automate
 
-Rebuilds the Reconciliation Monitor dashboard automatically. A scheduled cloud flow reads the recon
-tracker workbook, applies the dashboard's rules, republishes the page to SharePoint and mails a daily digest.
+Rebuilds the Reconciliation Monitor dashboard automatically. A scheduled cloud flow reads the archived
+weekly workbooks and the current Reconciliation Report, applies the dashboard's rules, saves the finished
+dashboard as an `.html` file in SharePoint and e-mails a daily summary with the dashboard attached.
 
 ```
 Recurrence (daily)
-  ├─ Get recon-config.json + page template        SharePoint
-  ├─ Run script  ReconMonitor                     Excel Online (Business)  ← all dashboard logic
-  │     returns dataJson · digestJson · subject · emailHtml · tiles · warnings
+  ├─ Get recon-config.json + page template         SharePoint
+  ├─ Get files in the archive folder               SharePoint   (one workbook per week, oldest first)
+  ├─ For each archived week: Run script (extract)  Excel Online (Business)  → rows of that week
+  ├─ Run script ReconMonitor on the current week   Excel Online (Business)  ← all dashboard logic
+  │     archiveJson = the weeks above;  returns dataJson · digestJson · subject · emailHtml · tiles · warnings
   ├─ Compose page  = template with dataJson injected
-  ├─ Publish page + recon-digest.json             SharePoint (overwrite)
-  └─ Send daily digest                            Outlook
+  ├─ Save Reconciliation-Monitor.html + digest     SharePoint (overwrite)
+  └─ Send daily summary + attached dashboard       Outlook
 ```
 
 The rules live in one Office Script because a flow cannot loop over ~50,000 customer × interface × day
 cells in reasonable time; the script does it in well under a second and is called with a single action.
 
+**No custom script needed.** The flow does not put a script page into SharePoint to be run there. The
+saved `.html` and the e-mail attachment open in the browser like any downloaded file, with all dashboards
+and the customer drill-down working.
+
 There are two ways to run it; both use the same rules code and the same configuration file.
 
 | | Live page in SharePoint | Power Automate flow |
 |---|---|---|
-| How | `sharepoint/Reconciliation-Monitor.aspx` reads the tracker workbook each time it is opened | A daily flow runs the Office Script and republishes the page |
+| How | `sharepoint/Reconciliation-Monitor.aspx` reads the tracker workbook each time it is opened | A daily flow runs the Office Script and saves / e-mails the dashboard |
 | Freshness | Always the last saved tracker | As of the last flow run |
-| Needs | Three files in a SharePoint library | Flow + Office Script |
-| Extras | `?asOf=yyyy-MM-dd`, `?mode=inspect` | E-mail digest, digest JSON |
+| Needs | Site with **custom script allowed** (admin) | Flow + Office Script; no admin setting |
+| Extras | `?asOf=yyyy-MM-dd`, `?mode=inspect` | E-mail summary with the dashboard attached, digest JSON |
 
 | File | Purpose |
 |---|---|
@@ -97,15 +104,22 @@ viewer's sign-in, computes the dashboard in the browser and renders it. No data 
 
 ### 1. Files in SharePoint
 
-Create a folder (for example `SiteAssets/ReconMonitor`) and upload
+Create a folder for the monitor (for example `Shared Documents/Recon/Monitor`) and upload
 
-- `recon-monitor.template.html`
+- `dashboard/recon-monitor.template.html`
 - `recon-config.json` — a copy of `config/recon-config.sample.json` with your values
+  (`siteUrl`, `trackerPath`, `archiveFolder` and `timeZone` are only used by the live page and can stay as they are)
+
+The flow saves `Reconciliation-Monitor.html` and `recon-digest.json` into the same folder.
 
 ### 2. Office Script
 
-Open the recon tracker in Excel for the web → **Automate → New script**, paste `ReconMonitor.ts`,
-rename it **ReconMonitor**, save.
+Open the current Reconciliation Report in Excel for the web → **Automate → New script**, paste
+`office-scripts/ReconMonitor.ts`, rename the script **ReconMonitor**, save. The script is stored in your
+OneDrive and can be run by the flow on any workbook, including the archived weeks.
+
+Check it once from Excel: run it with `mode` = `inspect` and paste the contents of `recon-config.json` into
+`configJson`; the `warnings` output lists, per interface, the sheet, header row and columns matched.
 
 ### 3. Match the configuration to the tracker
 
@@ -153,28 +167,71 @@ sheet, header row and columns matched, and adjust `recon-config.json` if a sheet
 
 ### 4. Build the flow
 
-Create a **Scheduled cloud flow** and add these steps (`flow/definition.json` has the same content as code).
+Create a **Scheduled cloud flow** and add the steps below. `flow/definition.json` holds the same flow as
+code (open any step and choose *Peek code* to compare). Name the steps exactly as in the first column so
+the expressions work as written.
 
-| # | Action | Values |
-|---|---|---|
-| 1 | **Recurrence** | Daily, your time zone, after the tracker is normally complete |
-| 2 | **Compose** → rename `Settings` | Object with `siteUrl`, `configPath`, `templatePath`, `outputFolder` (server-relative, e.g. `/sites/TechOps/SiteAssets/ReconMonitor`), `pageFile`, `digestFile`, `timeZone`, `mailTo` |
-| 3 | SharePoint **Get file content using path** → `Get config` | Site = `siteUrl`, path = `configPath`, *Infer content type* = **No** |
-| 4 | SharePoint **Get file content using path** → `Get template` | As above with `templatePath`, *Infer content type* = **No** |
-| 5 | Excel Online (Business) **Run script** → `Run script` | Pick the tracker workbook and script `ReconMonitor`. `configJson` = `base64ToString(body('Get_config')?['$content'])` · `asOf` = `convertTimeZone(utcNow(), 'UTC', outputs('Settings')?['timeZone'], 'yyyy-MM-dd')` · `mode` = `build` |
-| 6 | **Condition** `result/ok` is equal to `false` → **Terminate** (Failed) | Keeps the last good page when nothing could be read |
-| 7 | **Compose** → `Compose page` | `replace(base64ToString(body('Get_template')?['$content']), '"__RECON_DATA__"', body('Run_script')?['result']?['dataJson'])` |
-| 8 | SharePoint **Send an HTTP request to SharePoint** → `Publish page` | POST `_api/web/GetFolderByServerRelativeUrl('<outputFolder>')/Files/add(url='<pageFile>',overwrite=true)`, body = output of `Compose page` |
-| 9 | Same action → `Publish digest` | `url='<digestFile>'`, body = `result/digestJson` |
-| 10 | Outlook **Send an email (V2)** | To = `mailTo`, Subject = `result/subject`, Body (code view) = `result/emailHtml`, Importance = `if(body('Run_script')?['result']?['needsAttention'], 'High', 'Normal')` |
+| # | Step name | Action | Settings |
+|---|---|---|---|
+| 1 | — | **Recurrence** | Daily, your time zone, after the report is normally filled in (e.g. 07:15) |
+| 2 | `Settings` | **Compose** | The object shown below |
+| 3 | `Get_config` | SharePoint · **Get file content using path** | Site = your site, File path = `outputs('Settings')?['configPath']`, *Infer content type* = **No** |
+| 4 | `Get_template` | SharePoint · **Get file content using path** | File path = `outputs('Settings')?['templatePath']`, *Infer content type* = **No** |
+| 5 | `Get_archived_weeks` | SharePoint · **Get files (properties only)** | Library = the library holding the archive, *Limit entries to folder* = the archive folder, *Order By* = `Modified asc`, *Filter Query* = `FSObjType eq 0` |
+| 6 | `Only_workbooks` | **Filter array** | From = `body('Get_archived_weeks')?['value']`; advanced mode: `@and(or(endsWith(toLower(item()?['{FilenameWithExtension}']), '.xlsx'), endsWith(toLower(item()?['{FilenameWithExtension}']), '.xlsm')), not(startsWith(item()?['{FilenameWithExtension}'], '~')))` |
+| 7 | `Initialize_archive` | **Initialize variable** | Name `archive`, Type **Array**, Value `[]` |
+| 8 | `For_each_archived_week` | **Apply to each** over `body('Only_workbooks')` | Settings → *Concurrency control* **On**, degree **1** (keeps the weeks in order) |
+| 8a | `Run_script_on_archived_week` | Excel Online (Business) · **Run script** (inside the loop) | Location = your site, Library = archive library, File = `items('For_each_archived_week')?['{Identifier}']`, Script = `ReconMonitor`, `configJson` = `base64ToString(body('Get_config')?['$content'])`, `asOf` = `convertTimeZone(utcNow(), 'UTC', outputs('Settings')?['timeZone'], 'yyyy-MM-dd')`, `mode` = `extract`, `archiveJson` empty |
+| 8b | `Add_week` | **Append to array variable** (inside the loop) | Name `archive`, Value = `body('Run_script_on_archived_week')?['result']?['extractJson']` |
+| 9 | `Run_script` | Excel Online (Business) · **Run script** | File = the current Reconciliation Report, Script = `ReconMonitor`, `configJson` and `asOf` as in 8a, `mode` = `build`, `archiveJson` = `concat('[', join(variables('archive'), ','), ']')` |
+| 10 | `If_nothing_was_read` | **Condition** `body('Run_script')?['result']?['ok']` is equal to `false` | Yes branch: **Terminate**, status Failed, message `join(body('Run_script')?['result']?['warnings'], ' | ')` — keeps yesterday's dashboard when nothing could be read |
+| 11 | `Compose_page` | **Compose** | `replace(base64ToString(body('Get_template')?['$content']), '"__RECON_DATA__"', body('Run_script')?['result']?['dataJson'])` |
+| 12 | `Save_page` | SharePoint · **Send an HTTP request to SharePoint** | Method POST, Uri `_api/web/GetFolderByServerRelativeUrl('@{outputs('Settings')?['outputFolder']}')/Files/add(url='@{outputs('Settings')?['pageFile']}',overwrite=true)`, Body = output of `Compose_page` |
+| 13 | `Save_digest` | Same action | `url='@{outputs('Settings')?['digestFile']}'`, Body = `body('Run_script')?['result']?['digestJson']` (optional) |
+| 14 | `Send_daily_digest` | Office 365 Outlook · **Send an email (V2)** | To = `outputs('Settings')?['mailTo']`, Subject = `body('Run_script')?['result']?['subject']`, Body (code view `</>`) = `body('Run_script')?['result']?['emailHtml']`, Importance = `if(body('Run_script')?['result']?['needsAttention'], 'High', 'Normal')`, **Attachments**: Name = `Reconciliation-Monitor.html`, Content = `outputs('Compose_page')` |
 
-Publish the page under the same name and location the Batch Monitor page links to (or embeds), so the
-existing navigation keeps working. For Teams, add *Post message in a chat or channel* with
-`result/subject` and the `daily` tile values.
+`Settings` (step 2):
+
+```json
+{
+  "siteUrl": "https://TENANT.sharepoint.com/sites/TechOps",
+  "configPath": "/Shared Documents/Recon/Monitor/recon-config.json",
+  "templatePath": "/Shared Documents/Recon/Monitor/recon-monitor.template.html",
+  "archiveFolder": "/Shared Documents/Recon/Archive",
+  "outputFolder": "/sites/TechOps/Shared Documents/Recon/Monitor",
+  "pageFile": "Reconciliation-Monitor.html",
+  "digestFile": "recon-digest.json",
+  "timeZone": "Eastern Standard Time",
+  "mailTo": "techops-recon@TENANT.com"
+}
+```
+
+`configPath` / `templatePath` are relative to the site, `outputFolder` is server-relative (starts with
+`/sites/...`), `timeZone` is a Windows time-zone name as used by `convertTimeZone`.
+
+**Check on the first run**
+
+- **Archive file reference (step 8a).** The file is passed as `{Identifier}` from step 5. If the Excel action
+  reports that the file cannot be found, use its path inside the library instead, e.g.
+  `concat('/Recon/Archive/', items('For_each_archived_week')?['{FilenameWithExtension}'])`.
+- **Order of weeks.** Weeks are taken oldest first by *Modified*. If an archived file is edited later, it is
+  read later; that only matters when two workbooks hold the same day (then the later one wins).
+- **Run script limits.** Each call may run 120 s; there is a daily limit on the number of calls per user
+  (1,600 at the time of writing) — one call per archived week plus one, per run.
+- **Size.** Each archived week adds about 20 KB to `archiveJson`; the finished page is about 0.4 MB for
+  19 weeks. If the archive grows large, keep only the weeks you want in the history in the archive folder
+  (or filter step 6 on `Modified`).
+
+**Where people open it**
+
+- The e-mail attachment `Reconciliation-Monitor.html`: open it, and the whole dashboard runs in the browser.
+- The saved file in the SharePoint folder: SharePoint downloads it (it does not run pages with script), then
+  it opens in the browser. Link the Batch Monitor page to this file.
+- For Teams, add *Post message in a chat or channel* with `result/subject` and a link to the file.
 
 ### Script outputs available to the flow
 
-`ok`, `asOf`, `defaultDay`, `generated`, `dataJson`, `digestJson`, `subject`, `emailHtml`,
+`ok`, `asOf`, `defaultDay`, `generated`, `dataJson`, `digestJson`, `subject`, `emailHtml`, `extractJson` (mode `extract` only),
 `needsAttention` (variances without a ticket or feeds not reported on the default day), `warnings[]`,
 `dailyLabel` / `weeklyLabel` / `monthlyLabel`, and for each of `daily`, `weekly`, `monthly`:
 `inScope`, `fullyReconciled`, `notFullyReconciled`, `trackedViaTicket`, `notTrackedViaTicket`,
@@ -198,12 +255,12 @@ the template rendered with the script's data.
 
 ## Notes
 
-- Run script limits: 120 s per call, 5 MB of output, 1,600 calls per user per day. The current archive
-  (≈ 19 weeks) produces ≈ 0.4 MB and runs in a fraction of a second.
+- Run script limits (at the time of writing): 120 s per call, a few MB of input/output, 1,600 calls per
+  user per day. With ≈ 19 weeks the page is ≈ 0.4 MB and `archiveJson` ≈ 0.36 MB.
 - The page template differs from the hand-built page in four places: data comes from the placeholder,
   the name-alignment block is gone (the script does it), the preview banner became a "refreshed" stamp,
   and the per-feed key now allows archives longer than 400 days.
 - The built-in workbook reader handles standard `.xlsx` / `.xlsm` files; it does not read `.xlsb`, `.xls` or password-protected workbooks.
 - The schedule tab of the current workbook is applied to every week of the archive, as on the original dashboard.
-- The flow's Office Script reads the one workbook it is run on (the current week); the live page also reads the archive folder.
+- The flow reads the archived weeks with one `extract` call each and passes them to the run on the current week; the live page reads the archive folder directly. Both give the same dashboard.
 - `Claims Payment Extract` has no Variance column, so its reported rows count as reconciled.
